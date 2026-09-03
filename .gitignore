@@ -1,0 +1,17 @@
+# Generated at install time - contains local machine paths
+scripts/_ce_board_launch.cmd
+
+# Portable interpreter, fetched by Install.cmd (checksum-pinned)
+runtime/
+
+# Never commit credentials or session state. These live in the user profile,
+# not here, but guard against a stray copy.
+.azdo_cli_token.json
+.azdo_ce_board_url
+.azdo_ce_seen.json
+.azdo_ce_board.log
+*.token
+*.pat
+
+__pycache__/
+*.pyc
