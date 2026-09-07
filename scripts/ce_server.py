@@ -512,6 +512,7 @@ def item_detail(item_id):
         "mine": bool(mine_id) and (c.get("createdBy") or {}).get("id") == mine_id,
         "text": _strip_html(c.get("text", "")),
         "html": safe_html(c.get("text", "")),
+        "kept": _kept_preview(c.get("text", "")),
     } for c in raw]
     comments.sort(key=lambda c: c.get("at") or "")
     attachments = []
@@ -749,6 +750,28 @@ def _comment_images(text):
         if _is_ado_url(src) and src not in found:
             found.append(src)
     return found[:20]
+
+
+def _kept_preview(text):
+    """What an edit of this comment would carry over, ready to show.
+
+    Images become opaque /img proxy keys rather than raw attachment URLs, so
+    the page still cannot name a source of its own. The table HTML has already
+    been through _TableCleaner.
+    """
+    images = []
+    for i, src in enumerate(_comment_images(text)):
+        name = ""
+        query = urllib.parse.urlparse(src).query
+        for candidate in ("fileName", "filename"):
+            value = urllib.parse.parse_qs(query).get(candidate)
+            if value:
+                name = value[0]
+                break
+        images.append({"key": res_key(src),
+                       "name": name or "Image {}".format(i + 1)})
+    table = _comment_tables(text)
+    return {"images": images, "tables": [table] if table else []}
 
 
 def edit_comment(item_id, comment_id, changes):
@@ -1405,7 +1428,10 @@ PAGE = r"""<!doctype html>
  .rich pre{background:#f6f8fa;padding:8px;border-radius:6px;overflow:auto}
  .rich p{margin:6px 0}
  .rich a{color:#0969da}
- .shots{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0 12px}
+ .pastes.kept{margin-top:2px}
+.pastes.kept .paste{opacity:.85}
+.pastes.kept img{cursor:zoom-in}
+.shots{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0 12px}
  .shots figure{margin:0;width:130px}
  .shots img{width:130px;height:90px;object-fit:cover;border:1px solid #d0d7de;border-radius:6px;cursor:zoom-in;background:#fff}
  .shots figcaption{font-size:11px;color:#656d76;margin-top:3px;word-break:break-all;line-height:1.3}
@@ -1642,18 +1668,34 @@ function editComment(id, cid) {
         onkeydown="mentionKey(event, '${k}')"></textarea>
        <div class="mbox" id="mb${k}"></div></div>
      <div class="pastes" id="pv${k}"></div>
+     ${keptStrip(c.kept)}
      <div class="acts">
        <button onclick="saveComment(${id},${cid})" id="b${k}">Save comment</button>
        <button class="sec" onclick="cancelComment(${id},${cid})">Cancel</button>
        <span class="msg" id="m${k}"></span>
-     </div>
-     <div class="meta">Images and tables already in this comment are kept.</div>`;
+     </div>`;
   picked[k] = [];
   pasted[k] = [];
   tabled[k] = [];
   const ta = document.getElementById("c" + k);
   ta.value = c.text || "";
   ta.focus();
+}
+
+// What is already attached to the comment being edited. Shown so a screenshot
+// is visible while you type instead of only described. Read-only: the server
+// re-reads these from Azure DevOps and carries them over on its own.
+function keptStrip(kept) {
+  const imgs = ((kept || {}).images) || [];
+  const tabs = ((kept || {}).tables) || [];
+  if (!imgs.length && !tabs.length) return "";
+  const shown = imgs.map(im =>
+    `<span class="paste"><img src="/img?n=${NONCE}&k=${encodeURIComponent(im.key)}"
+       alt="${esc(im.name)}" title="${esc(im.name)}" onclick="zoom(this.src)"></span>`).join("")
+    // Already sanitised to a bare table by the server.
+    + tabs.map(t => `<span class="paste tbl"><span class="tprev">${t}</span></span>`).join("");
+  return `<div class="meta">Already in this comment &mdash; kept when you save</div>
+          <div class="pastes kept">${shown}</div>`;
 }
 
 function cancelComment(id, cid) {

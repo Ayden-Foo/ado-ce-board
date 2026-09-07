@@ -103,6 +103,9 @@ sees your password.
   so your token cannot be forwarded elsewhere.
 - The comment editor has the same @mention, screenshot paste and table paste
   as the new-comment box.
+- While editing, any screenshots and tables already in that comment are shown
+  under **Already in this comment**, so you can see what you are keeping.
+  Click a thumbnail to enlarge it. They are carried over automatically.
 - Pasted tables are stripped to plain rows and cells on the server: every
   attribute except `colspan`/`rowspan` is discarded, and anything outside the
   table is dropped. Excel's `<style>`/`<script>` blocks never reach the work
