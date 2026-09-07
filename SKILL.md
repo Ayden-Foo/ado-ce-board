@@ -255,6 +255,14 @@ work items or statuses.
 
 ## Security design (do not regress these)
 
+- Identities are compared by GUID (`identity_id`, `my_identity_id`), never by
+  display name: the profile says "Ayden Foo" while work item fields say
+  "Foo, Ayden". Comment ownership, own-edit suppression and "assigned to you"
+  all depend on this.
+- `edit_comment()` re-reads the comment from Azure DevOps and refuses when the
+  author is not the signed-in identity. Images kept on edit come from that
+  server-side read (`_comment_images`), not from the page.
+
 - Pasted screenshots go through `/api/upload`, which returns the attachment
   URL plus an HMAC proxy key. The server records every URL it minted in
   `_uploaded`; `_allowed_images()` lets a comment embed **only** those URLs,

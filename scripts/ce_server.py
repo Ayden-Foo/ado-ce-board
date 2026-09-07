@@ -30,6 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from html import unescape
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -145,6 +146,15 @@ def call(path, payload=None, method=None, patch=False, attempts=4):
     raise ApiError(503, "Azure DevOps did not respond.")
 
 
+def identity_id(value):
+    """The stable GUID behind a System.* identity field.
+
+    Display names cannot be compared: the profile reports "Ayden Foo"
+    while work item fields report "Foo, Ayden".
+    """
+    return value.get("id", "") if isinstance(value, dict) else ""
+
+
 def identity_name(value):
     if isinstance(value, dict):
         return value.get("displayName") or value.get("uniqueName") or ""
@@ -235,6 +245,8 @@ def list_items(open_only=True, match="both", top=200):
         "createdBy": identity_name(it["fields"].get("System.CreatedBy")),
         "changedDate": it["fields"].get("System.ChangedDate", ""),
         "changedBy": identity_name(it["fields"].get("System.ChangedBy")),
+        "changedById": identity_id(it["fields"].get("System.ChangedBy")),
+        "assignedToId": identity_id(it["fields"].get("System.AssignedTo")),
         "tags": it["fields"].get("System.Tags", ""),
         "project": it["fields"].get("System.TeamProject", ""),
         "url": "https://dev.azure.com/{}/{}/_workitems/edit/{}".format(
@@ -484,10 +496,17 @@ def item_detail(item_id):
         raw = fetch_comments(item_id, owner)
     except ApiError:
         raw = []
+    try:
+        mine_id = my_identity_id()
+    except ApiError:
+        mine_id = ""
     comments = [{
         "id": c.get("id"),
         "author": (c.get("createdBy") or {}).get("displayName", ""),
         "at": c.get("createdDate", ""),
+        "edited": bool(c.get("modifiedDate")
+                       and c.get("modifiedDate") != c.get("createdDate")),
+        "mine": bool(mine_id) and (c.get("createdBy") or {}).get("id") == mine_id,
         "text": _strip_html(c.get("text", "")),
         "html": safe_html(c.get("text", "")),
     } for c in raw]
@@ -555,6 +574,48 @@ def item_detail(item_id):
         "links": links,
         "comments": comments,
     }
+
+
+def _comment_images(text):
+    """Attachment images already embedded in a comment, so an edit keeps them.
+
+    The HTML is read back from Azure DevOps rather than trusted from the page,
+    so this cannot be used to smuggle an arbitrary image source into a comment.
+    """
+    found = []
+    for src in re.findall(r'<img[^>]*\ssrc="([^"]*)"', text or "", re.I):
+        src = unescape(src)
+        if _is_ado_url(src) and src not in found:
+            found.append(src)
+    return found[:20]
+
+
+def edit_comment(item_id, comment_id, changes):
+    """Rewrite one of the signed-in user's own Discussion comments."""
+    project = changes.get("project") or PROJECT
+    path = ("{}/_apis/wit/workItems/{}/comments/{}?api-version=7.1-preview.4"
+            .format(urllib.parse.quote(project), int(item_id), int(comment_id)))
+    existing = call(path)
+    mine_id = my_identity_id()
+    author = (existing.get("createdBy") or {}).get("id") or ""
+    # Azure DevOps rejects this server-side too; failing here gives a clear
+    # message instead of a raw 401 from the API.
+    if mine_id and author and author != mine_id:
+        raise ApiError(403, "Azure DevOps only lets you edit your own comments.")
+    kept = _comment_images(existing.get("text", ""))
+    added = [src for src in _allowed_images(changes.get("images"))
+             if src not in kept]
+    body = build_comment_html((changes.get("comment") or "").strip(),
+                              changes.get("mentions"))
+    for src in kept + added:
+        if body:
+            body += "<br>"
+        body += '<img src="{}" style="max-width:100%">'.format(_esc_html(src))
+    if not body:
+        raise ApiError(400, "A comment cannot be empty. Delete it in Azure "
+                            "DevOps if that is what you meant.")
+    call(path, {"text": body}, method="PATCH")
+    return {"ok": True, "images": len(kept) + len(added)}
 
 
 def _annotate_links(links):
@@ -663,6 +724,8 @@ def _hydrate(ids):
         "createdBy": identity_name(it["fields"].get("System.CreatedBy")),
         "changedDate": it["fields"].get("System.ChangedDate", ""),
         "changedBy": identity_name(it["fields"].get("System.ChangedBy")),
+        "changedById": identity_id(it["fields"].get("System.ChangedBy")),
+        "assignedToId": identity_id(it["fields"].get("System.AssignedTo")),
         "tags": it["fields"].get("System.Tags", ""),
         "project": it["fields"].get("System.TeamProject", ""),
         "url": "https://dev.azure.com/{}/{}/_workitems/edit/{}".format(
@@ -993,21 +1056,24 @@ def _push_note(item, kind, author, text, at=""):
         del _feed[FEED_LIMIT:]
 
 
-def _check_field_changes(item, item_id, tracked, me, first_pass):
+def _check_field_changes(item, item_id, tracked, mine_id, first_pass):
     """Notify when State or Assigned To moved since the last poll.
 
     The first run only records a baseline, so a fresh install never fires a
     burst of toasts for history the user has already seen.
     """
     current = {"state": item.get("state") or "",
-               "assignedTo": item.get("assignedTo") or ""}
+               "assignedTo": item.get("assignedTo") or "",
+               "assignedToId": item.get("assignedToId") or ""}
     previous = tracked.get(item_id)
     tracked[item_id] = current
     if previous is None or first_pass:
         return
     who = item.get("changedBy") or "Someone"
     # Skip our own edits: the board already showed the result of those.
-    mine = bool(me) and who == me
+    # Identities are matched on id because the profile display name
+    # ("Ayden Foo") and the work item one ("Foo, Ayden") differ.
+    mine = bool(mine_id) and item.get("changedById") == mine_id
     if previous.get("state") != current["state"]:
         change = "{} -> {}".format(previous.get("state") or "(none)",
                                    current["state"] or "(none)")
@@ -1015,9 +1081,11 @@ def _check_field_changes(item, item_id, tracked, me, first_pass):
         if not mine:
             toast("State changed on {}".format(item["id"]),
                   "{} ({})".format(change, who))
-    if previous.get("assignedTo") != current["assignedTo"]:
+    if previous.get("assignedToId", previous.get("assignedTo")) != current["assignedToId"]:
+        if "assignedToId" not in previous:
+            return  # upgraded snapshot: this poll only re-baselines the owner
         new_owner = current["assignedTo"] or "(unassigned)"
-        to_me = bool(me) and current["assignedTo"] == me
+        to_me = bool(mine_id) and current["assignedToId"] == mine_id
         change = "{} -> {}".format(previous.get("assignedTo") or "(unassigned)",
                                    new_owner)
         _push_note(item, "assigned", who,
@@ -1032,7 +1100,7 @@ def poll_comments(interval, stop_event):
     """Watch open items for new comments, state changes and reassignments."""
     seen, tracked = _load_seen()
     first_pass = not seen and not tracked
-    me = ""
+    mine_id = ""
     while not stop_event.is_set():
         try:
             # Before first sign-in there is nothing to poll; wait quietly
@@ -1040,14 +1108,14 @@ def poll_comments(interval, stop_event):
             if not azdo_auth.have_credentials():
                 stop_event.wait(interval)
                 continue
-            if not me:
-                me = my_display_name()
+            if not mine_id:
+                mine_id = my_identity_id()
             items = list_items(open_only=True)
             active_ids = set()
             for item in items:
                 item_id = str(item["id"])
                 active_ids.add(item_id)
-                _check_field_changes(item, item_id, tracked, me, first_pass)
+                _check_field_changes(item, item_id, tracked, mine_id, first_pass)
                 known = seen.setdefault(item_id, set())
                 try:
                     comments = fetch_comments(item_id)
@@ -1058,11 +1126,11 @@ def poll_comments(interval, stop_event):
                     if cid in known:
                         continue
                     known.add(cid)
-                    author = ((comment.get("createdBy") or {}).get("displayName")
-                              or "Someone")
+                    by = comment.get("createdBy") or {}
+                    author = by.get("displayName") or "Someone"
                     # Seeding the very first run would fire a burst of toasts for
                     # history the user has already read.
-                    if first_pass or author == me:
+                    if first_pass or (mine_id and by.get("id") == mine_id):
                         continue
                     body = _strip_html(comment.get("text", ""))[:200]
                     _push_note(item, "comment", author, body,
@@ -1110,14 +1178,14 @@ PAGE = r"""<!doctype html>
  textarea{min-height:64px;resize:vertical}
 .ctext{min-height:150px;max-height:60vh;line-height:1.5;resize:vertical;overflow-y:auto}
 .chint{float:right;font-size:11px;color:#8c959f;font-weight:400}
-.shots{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 0}
-.shot{position:relative;display:inline-flex;align-items:center;border:1px solid #d0d7de;
+.pastes{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 0}
+.paste{position:relative;display:inline-flex;align-items:center;border:1px solid #d0d7de;
       border-radius:6px;padding:2px;background:#fff}
-.shot img{max-height:72px;max-width:120px;border-radius:4px;cursor:zoom-in;display:block}
-.shot a{position:absolute;top:-8px;right:-8px;width:18px;height:18px;line-height:16px;
+.paste img{max-height:72px;max-width:120px;border-radius:4px;cursor:zoom-in;display:block}
+.paste a{position:absolute;top:-8px;right:-8px;width:18px;height:18px;line-height:16px;
         text-align:center;border-radius:50%;background:#57606a;color:#fff;font-size:13px;
         text-decoration:none}
-.shot.busy{padding:6px 10px;font-size:12px;color:#57606a}
+.paste.busy{padding:6px 10px;font-size:12px;color:#57606a}
 .kind{display:inline-block;font-size:10px;text-transform:uppercase;letter-spacing:.4px;
       border-radius:8px;padding:1px 7px;margin-right:6px;background:#ddf4ff;color:#0969da}
 .kind.state{background:#fff1e5;color:#bc4c00}
@@ -1291,7 +1359,7 @@ function render() {
              onpaste="onPaste(event, ${w.id})"
              onkeydown="mentionKey(event, ${w.id})"></textarea>
           <div class="mbox" id="mb${w.id}"></div></div>
-        <div class="shots" id="sh${w.id}"></div>
+        <div class="pastes" id="pv${w.id}"></div>
         <div class="acts">
           <button onclick="save(${w.id})" id="b${w.id}">Save</button>
           <a class="ext" href="${w.url}" target="_blank" rel="noopener">Open in Azure DevOps</a>
@@ -1380,20 +1448,73 @@ async function unlink(id, url, what) {
   } catch (e) { alert(String(e.message || e)); }
 }
 
+// Last loaded detail per work item, so the comment editor can find the
+// original text without a second round trip.
+const detailCache = {};
+
+function editComment(id, cid) {
+  const row = document.getElementById("cm" + id + "-" + cid);
+  const d = detailCache[id];
+  if (!row || !d) return;
+  const c = (d.comments || []).find(x => x.id === cid);
+  if (!c || row.querySelector("textarea")) return;
+  row.dataset.html = row.innerHTML;
+  row.innerHTML =
+    `<span class="meta">${esc(c.author)} &middot; editing</span>
+     <textarea class="ctext" id="ce${id}-${cid}"
+        onmousedown="markH(this)" onmouseup="saveH(this)"></textarea>
+     <div class="acts">
+       <button onclick="saveComment(${id},${cid})" id="cb${id}-${cid}">Save comment</button>
+       <button class="sec" onclick="cancelComment(${id},${cid})">Cancel</button>
+       <span class="msg" id="cmsg${id}-${cid}"></span>
+     </div>
+     <div class="meta">Images already in this comment are kept.</div>`;
+  const ta = document.getElementById("ce" + id + "-" + cid);
+  ta.value = c.text || "";
+  ta.focus();
+}
+
+function cancelComment(id, cid) {
+  const row = document.getElementById("cm" + id + "-" + cid);
+  if (row && row.dataset.html) row.innerHTML = row.dataset.html;
+}
+
+async function saveComment(id, cid) {
+  const ta = document.getElementById("ce" + id + "-" + cid);
+  const msg = document.getElementById("cmsg" + id + "-" + cid);
+  const btn = document.getElementById("cb" + id + "-" + cid);
+  const text = (ta.value || "").trim();
+  if (!text) { msg.className = "msg err"; msg.textContent = "Comment cannot be empty."; return; }
+  btn.disabled = true; msg.className = "msg"; msg.textContent = "Saving...";
+  const project = ((detailCache[id] || {}).item || {}).project || PROJECT;
+  try {
+    await api("/api/comment", {method: "POST", body: JSON.stringify(
+      {id: id, commentId: cid, comment: text, project: project})});
+    await loadDetail(id);
+  } catch (e) {
+    btn.disabled = false;
+    msg.className = "msg err"; msg.textContent = String(e.message || e);
+  }
+}
+
 async function loadDetail(id) {
   const box = document.getElementById("d" + id);
   if (!box) return;
   box.textContent = "Loading details...";
   try {
     const d = await api("/api/detail?id=" + id);
+    detailCache[id] = d;
     const it = d.item, body = it.descriptionHtml || it.reproHtml || "";
     const meta = [["Created", `${esc(it.createdBy)} on ${esc((it.createdDate || "").slice(0, 10))}`],
                   ["Updated", esc((it.changedDate || "").slice(0, 16).replace("T", " "))],
                   ["Area", esc(it.areaPath)], ["Reason", esc(it.reason)],
                   ["Tags", esc(it.tags) || "-"]];
     const thread = d.comments.length
-      ? d.comments.map(c => `<div class="cm"><span class="meta">${esc(c.author)} &middot; ${
-            esc((c.at || "").slice(0, 16).replace("T", " "))}</span><div class="rich">${
+      ? d.comments.map(c => `<div class="cm" id="cm${id}-${c.id}"><span class="meta">${esc(c.author)} &middot; ${
+            esc((c.at || "").slice(0, 16).replace("T", " "))}${
+            c.edited ? " &middot; edited" : ""}${
+            c.mine ? ` &middot; <a href="#" onclick="event.preventDefault();editComment(${id},${c.id})">edit</a>` : ""
+          }</span><div class="rich">${
             c.html || esc(c.text)}</div></div>`).join("")
       : `<div class="meta">No comments yet.</div>`;
     const files = d.attachments || [];
@@ -1472,25 +1593,25 @@ async function openItem(id) {
 }
 
 // Screenshots pasted into a comment, per work item, pending the next Save.
-const shots = {};
+const pasted = {};
 
-function renderShots(id) {
-  const box = document.getElementById("sh" + id);
+function renderPastes(id) {
+  const box = document.getElementById("pv" + id);
   if (!box) return;
-  const list = shots[id] || [];
+  const list = pasted[id] || [];
   box.innerHTML = list.map((s, i) => s.pending
-    ? `<span class="shot busy">Uploading ${esc(s.name)}...</span>`
-    : `<span class="shot"><img src="/img?n=${NONCE}&k=${encodeURIComponent(s.key)}"
+    ? `<span class="paste busy">Uploading ${esc(s.name)}...</span>`
+    : `<span class="paste"><img src="/img?n=${NONCE}&k=${encodeURIComponent(s.key)}"
          alt="${esc(s.name)}" onclick="zoom(this.src)">
        <a href="#" title="Remove from this comment"
-          onclick="event.preventDefault();dropShot(${id},${i})">&times;</a></span>`).join("");
+          onclick="event.preventDefault();dropPaste(${id},${i})">&times;</a></span>`).join("");
 }
 
-function dropShot(id, i) {
+function dropPaste(id, i) {
   // The file stays attached to the work item; this only unpicks it from the
   // comment being written.
-  (shots[id] || []).splice(i, 1);
-  renderShots(id);
+  (pasted[id] || []).splice(i, 1);
+  renderPastes(id);
 }
 
 async function onPaste(ev, id) {
@@ -1504,13 +1625,13 @@ async function onPaste(ev, id) {
   if (!files.length) return;   // plain text paste: leave it to the browser
   ev.preventDefault();
   const msg = document.getElementById("m" + id);
-  shots[id] = shots[id] || [];
+  pasted[id] = pasted[id] || [];
   for (const f of files) {
     const ext = (f.type.split("/")[1] || "png").replace(/[^a-z0-9]/gi, "") || "png";
     const name = "pasted-" + Date.now() + "." + ext;
     const slot = {name: name, pending: true};
-    shots[id].push(slot);
-    renderShots(id);
+    pasted[id].push(slot);
+    renderPastes(id);
     try {
       const r = await fetch(`/api/upload?id=${id}&name=${encodeURIComponent(name)}`
                             + `&comment=${encodeURIComponent("Pasted into a comment")}`, {
@@ -1522,10 +1643,10 @@ async function onPaste(ev, id) {
       if (!r.ok) throw new Error(d.error || r.status);
       slot.pending = false; slot.url = d.url; slot.key = d.key; slot.name = d.name;
     } catch (e) {
-      shots[id].splice(shots[id].indexOf(slot), 1);
+      pasted[id].splice(pasted[id].indexOf(slot), 1);
       if (msg) { msg.className = "msg err"; msg.textContent = "Paste failed: " + String(e.message || e); }
     }
-    renderShots(id);
+    renderPastes(id);
   }
 }
 
@@ -1536,7 +1657,7 @@ async function save(id) {
         state = document.getElementById("s" + id).value,
         who = document.getElementById("a" + id).value.trim(),
         comment = document.getElementById("c" + id).value;
-  const imgs = (shots[id] || []).filter(s => !s.pending && s.url).map(s => s.url);
+  const imgs = (pasted[id] || []).filter(s => !s.pending && s.url).map(s => s.url);
   if (title && title !== w.title) fields["System.Title"] = title;
   if (state && state !== w.state) fields["System.State"] = state;
   if (who !== w.assignedTo) fields["System.AssignedTo"] = who;
@@ -1551,8 +1672,8 @@ async function save(id) {
                     + (imgs.length ? ` ${imgs.length} image(s) added.` : "");
     document.getElementById("c" + id).value = "";
     picked[id] = [];
-    shots[id] = [];
-    renderShots(id);
+    pasted[id] = [];
+    renderPastes(id);
     await load(true);
     openItem(id);
   } catch (e) { msg.className = "msg err"; msg.textContent = String(e.message || e); }
@@ -1943,6 +2064,13 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(400, "Bad work item id.")
                 remove_relation(item_id, payload.get("url", ""))
                 return self._send(200, json.dumps({"ok": True}))
+            if url.path == "/api/comment":
+                item_id = str(payload.get("id", ""))
+                comment_id = str(payload.get("commentId", ""))
+                if not item_id.isdigit() or not comment_id.isdigit():
+                    raise ApiError(400, "Bad work item or comment id.")
+                return self._send(200, json.dumps(
+                    edit_comment(item_id, comment_id, payload)))
             if url.path.startswith("/api/item/"):
                 item_id = url.path.rsplit("/", 1)[-1]
                 if not item_id.isdigit():

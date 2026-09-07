@@ -45,6 +45,7 @@ Open the **CE Board** shortcut.
 | Change State / Assignee / Title | Expand the row, edit, **Save** |
 | Comment | Expand the row, type in the comment box, **Save** |
 | Add a screenshot to a comment | Paste it straight into the comment box; a thumbnail appears, **Save** posts it |
+| Fix a comment you already posted | Click **edit** on your own comment in Discussion, change it, **Save comment** |
 | Resize the comment box | Drag its bottom-right corner; the size is remembered |
 | Tag a colleague | Type `@` plus 2+ letters and pick from the list |
 | Find an old case | Type a keyword or the ID, tick *include closed* |
@@ -99,6 +100,9 @@ sees your password.
 - Attachments and inline images are fetched with your token by the board, and
   only from this organisation's Azure DevOps host. Redirects are not followed,
   so your token cannot be forwarded elsewhere.
+- You can only edit your **own** comments; Azure DevOps enforces this and the
+  tool checks it too. Editing keeps any images already in that comment.
+  Azure DevOps records the edit, so the change is auditable.
 - Pasted screenshots are uploaded to the work item as normal Azure DevOps
   attachments and embedded in the comment. Nothing is written to local disk.
   A comment can only embed an image this tool itself uploaded in the same
