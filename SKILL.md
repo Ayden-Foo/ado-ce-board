@@ -255,6 +255,12 @@ work items or statuses.
 
 ## Security design (do not regress these)
 
+- Pasted screenshots go through `/api/upload`, which returns the attachment
+  URL plus an HMAC proxy key. The server records every URL it minted in
+  `_uploaded`; `_allowed_images()` lets a comment embed **only** those URLs,
+  and re-checks them with `_is_ado_url()`. A page cannot make the server
+  embed an arbitrary `<img src>`.
+
 - **The page URL is a secret.** `GET /` returns 404; the page is served only at
   `/<NONCE>/`, and the URL is published to `~/.azdo_ce_board_url` (mode 0600)
   for `open_board.py`. Serving the nonce-bearing page at `/` would hand every

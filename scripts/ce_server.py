@@ -89,7 +89,7 @@ _bind_output()
 FIELDS = [
     "System.Id", "System.WorkItemType", "System.Title", "System.State",
     "System.AssignedTo", "System.CreatedBy", "System.CreatedDate",
-    "System.ChangedDate", "System.Tags", "System.TeamProject",
+    "System.ChangedDate", "System.ChangedBy", "System.Tags", "System.TeamProject",
 ]
 
 _states_cache = {}
@@ -234,6 +234,7 @@ def list_items(open_only=True, match="both", top=200):
         "assignedTo": identity_name(it["fields"].get("System.AssignedTo")),
         "createdBy": identity_name(it["fields"].get("System.CreatedBy")),
         "changedDate": it["fields"].get("System.ChangedDate", ""),
+        "changedBy": identity_name(it["fields"].get("System.ChangedBy")),
         "tags": it["fields"].get("System.Tags", ""),
         "project": it["fields"].get("System.TeamProject", ""),
         "url": "https://dev.azure.com/{}/{}/_workitems/edit/{}".format(
@@ -302,6 +303,24 @@ def build_comment_html(text, mentions):
     return html.replace("\r\n", "\n").replace("\n", "<br>")
 
 
+# Attachment URLs this server minted, so a comment can only embed images that
+# really came from an upload we performed.
+_upload_lock = threading.Lock()
+_uploaded = set()
+
+
+def _allowed_images(urls):
+    """Keep only attachment URLs this process uploaded and that are ours."""
+    out = []
+    for candidate in (urls or [])[:20]:
+        candidate = str(candidate)
+        with _upload_lock:
+            known = candidate in _uploaded
+        if known and _is_ado_url(candidate) and candidate not in out:
+            out.append(candidate)
+    return out
+
+
 def update_item(item_id, changes):
     """Apply field edits and/or a comment to one work item."""
     ops = []
@@ -315,9 +334,15 @@ def update_item(item_id, changes):
         else:
             ops.append({"op": "add", "path": "/fields/" + field, "value": value})
     comment = (changes.get("comment") or "").strip()
-    if comment:
+    images = _allowed_images(changes.get("images"))
+    if comment or images:
+        html = build_comment_html(comment, changes.get("mentions"))
+        for src in images:
+            if html:
+                html += "<br>"
+            html += '<img src="{}" style="max-width:100%">'.format(_esc_html(src))
         ops.append({"op": "add", "path": "/fields/System.History",
-                    "value": build_comment_html(comment, changes.get("mentions"))})
+                    "value": html})
     if not ops:
         raise ApiError(400, "Nothing to update.")
     return call("{}/_apis/wit/workitems/{}?api-version={}".format(
@@ -365,7 +390,15 @@ def upload_attachment(item_id, file_name, blob, comment=""):
     if comment:
         attrs["comment"] = comment[:250]
     _add_relation(item_id, "AttachedFile", created["url"], attrs)
-    return {"name": name, "url": created["url"], "size": len(blob)}
+    # Remember what we uploaded so a later comment may embed it; nothing the
+    # page did not obtain from this server can be turned into an <img>.
+    with _upload_lock:
+        _uploaded.add(created["url"])
+        if len(_uploaded) > 500:
+            _uploaded.clear()
+            _uploaded.add(created["url"])
+    return {"name": name, "url": created["url"], "size": len(blob),
+            "key": res_key(created["url"])}
 
 
 def _add_relation(item_id, rel, url, attributes):
@@ -629,6 +662,7 @@ def _hydrate(ids):
         "assignedTo": identity_name(it["fields"].get("System.AssignedTo")),
         "createdBy": identity_name(it["fields"].get("System.CreatedBy")),
         "changedDate": it["fields"].get("System.ChangedDate", ""),
+        "changedBy": identity_name(it["fields"].get("System.ChangedBy")),
         "tags": it["fields"].get("System.Tags", ""),
         "project": it["fields"].get("System.TeamProject", ""),
         "url": "https://dev.azure.com/{}/{}/_workitems/edit/{}".format(
@@ -643,18 +677,23 @@ def _hydrate(ids):
 # --------------------------------------------------------------------------
 
 def _load_seen():
+    """Return (comment ids per item, last known state/assignee per item)."""
     try:
         with open(SEEN_PATH, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-        return {str(k): set(v) for k, v in data.get("comments", {}).items()}
-    except (IOError, OSError, ValueError):
-        return {}
+        comments = {str(k): set(v) for k, v in data.get("comments", {}).items()}
+        fields = {str(k): dict(v) for k, v in (data.get("fields") or {}).items()
+                  if isinstance(v, dict)}
+        return comments, fields
+    except (IOError, OSError, ValueError, TypeError):
+        return {}, {}
 
 
-def _save_seen(seen):
+def _save_seen(seen, fields):
     try:
         with open(SEEN_PATH, "w", encoding="utf-8") as handle:
-            json.dump({"comments": {k: sorted(v) for k, v in seen.items()}}, handle)
+            json.dump({"comments": {k: sorted(v) for k, v in seen.items()},
+                       "fields": fields}, handle)
     except (IOError, OSError):
         pass
 
@@ -938,10 +977,61 @@ def _strip_html(text):
                   .replace("&gt;", ">")).strip()
 
 
+def _push_note(item, kind, author, text, at=""):
+    """Add one entry to the in-page notification feed."""
+    entry = {
+        "workItemId": item["id"],
+        "title": item["title"],
+        "kind": kind,
+        "author": author,
+        "text": text,
+        "at": at or item.get("changedDate", ""),
+        "url": item["url"],
+    }
+    with _feed_lock:
+        _feed.insert(0, entry)
+        del _feed[FEED_LIMIT:]
+
+
+def _check_field_changes(item, item_id, tracked, me, first_pass):
+    """Notify when State or Assigned To moved since the last poll.
+
+    The first run only records a baseline, so a fresh install never fires a
+    burst of toasts for history the user has already seen.
+    """
+    current = {"state": item.get("state") or "",
+               "assignedTo": item.get("assignedTo") or ""}
+    previous = tracked.get(item_id)
+    tracked[item_id] = current
+    if previous is None or first_pass:
+        return
+    who = item.get("changedBy") or "Someone"
+    # Skip our own edits: the board already showed the result of those.
+    mine = bool(me) and who == me
+    if previous.get("state") != current["state"]:
+        change = "{} -> {}".format(previous.get("state") or "(none)",
+                                   current["state"] or "(none)")
+        _push_note(item, "state", who, "State: " + change)
+        if not mine:
+            toast("State changed on {}".format(item["id"]),
+                  "{} ({})".format(change, who))
+    if previous.get("assignedTo") != current["assignedTo"]:
+        new_owner = current["assignedTo"] or "(unassigned)"
+        to_me = bool(me) and current["assignedTo"] == me
+        change = "{} -> {}".format(previous.get("assignedTo") or "(unassigned)",
+                                   new_owner)
+        _push_note(item, "assigned", who,
+                   ("Assigned to you" if to_me else "Assigned") + ": " + change)
+        if to_me or not mine:
+            toast(("Assigned to you: {}" if to_me else "Reassigned: {}")
+                  .format(item["id"]),
+                  "{} ({})".format(change, who))
+
+
 def poll_comments(interval, stop_event):
-    """Watch open items for new comments and raise a desktop notification."""
-    seen = _load_seen()
-    first_pass = not seen
+    """Watch open items for new comments, state changes and reassignments."""
+    seen, tracked = _load_seen()
+    first_pass = not seen and not tracked
     me = ""
     while not stop_event.is_set():
         try:
@@ -957,6 +1047,7 @@ def poll_comments(interval, stop_event):
             for item in items:
                 item_id = str(item["id"])
                 active_ids.add(item_id)
+                _check_field_changes(item, item_id, tracked, me, first_pass)
                 known = seen.setdefault(item_id, set())
                 try:
                     comments = fetch_comments(item_id)
@@ -974,23 +1065,16 @@ def poll_comments(interval, stop_event):
                     if first_pass or author == me:
                         continue
                     body = _strip_html(comment.get("text", ""))[:200]
-                    entry = {
-                        "workItemId": item["id"],
-                        "title": item["title"],
-                        "author": author,
-                        "text": body,
-                        "at": comment.get("createdDate", ""),
-                        "url": item["url"],
-                    }
-                    with _feed_lock:
-                        _feed.insert(0, entry)
-                        del _feed[FEED_LIMIT:]
+                    _push_note(item, "comment", author, body,
+                               comment.get("createdDate", ""))
                     toast("New comment on {}".format(item["id"]),
                           "{}: {}".format(author, body))
             # Drop state for items that closed so the file cannot grow forever.
             for stale in set(seen) - active_ids:
                 seen.pop(stale, None)
-            _save_seen(seen)
+            for stale in set(tracked) - active_ids:
+                tracked.pop(stale, None)
+            _save_seen(seen, tracked)
             first_pass = False
         except Exception as exc:
             print("[poll] {}".format(exc))
@@ -1026,6 +1110,18 @@ PAGE = r"""<!doctype html>
  textarea{min-height:64px;resize:vertical}
 .ctext{min-height:150px;max-height:60vh;line-height:1.5;resize:vertical;overflow-y:auto}
 .chint{float:right;font-size:11px;color:#8c959f;font-weight:400}
+.shots{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 0}
+.shot{position:relative;display:inline-flex;align-items:center;border:1px solid #d0d7de;
+      border-radius:6px;padding:2px;background:#fff}
+.shot img{max-height:72px;max-width:120px;border-radius:4px;cursor:zoom-in;display:block}
+.shot a{position:absolute;top:-8px;right:-8px;width:18px;height:18px;line-height:16px;
+        text-align:center;border-radius:50%;background:#57606a;color:#fff;font-size:13px;
+        text-decoration:none}
+.shot.busy{padding:6px 10px;font-size:12px;color:#57606a}
+.kind{display:inline-block;font-size:10px;text-transform:uppercase;letter-spacing:.4px;
+      border-radius:8px;padding:1px 7px;margin-right:6px;background:#ddf4ff;color:#0969da}
+.kind.state{background:#fff1e5;color:#bc4c00}
+.kind.assigned{background:#dafbe1;color:#1a7f37}
  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
  .acts{margin-top:12px;display:flex;gap:8px;align-items:center}
  button{background:#1f883d;color:#fff;border:0;padding:8px 16px;border-radius:6px;cursor:pointer;font:inherit;font-weight:500}
@@ -1185,14 +1281,17 @@ function render() {
           <div><label>Assigned to (email, blank to unassign)</label>
                <input id="a${w.id}" value="${esc(w.assignedTo)}"></div>
         </div>
-        <label>Comment (added to Discussion) &mdash; type @ to tag someone
+        <label>Comment (added to Discussion) &mdash; type @ to tag someone,
+          paste a screenshot to attach it
           <span class="chint">drag the corner to resize &middot;
             <a href="#" onclick="event.preventDefault();resetCH()">reset</a></span></label>
         <div class="cwrap"><textarea id="c${w.id}" class="ctext" autocomplete="off"
              oninput="onComment(${w.id}); grow(this)"
              onmousedown="markH(this)" onmouseup="saveH(this)"
+             onpaste="onPaste(event, ${w.id})"
              onkeydown="mentionKey(event, ${w.id})"></textarea>
           <div class="mbox" id="mb${w.id}"></div></div>
+        <div class="shots" id="sh${w.id}"></div>
         <div class="acts">
           <button onclick="save(${w.id})" id="b${w.id}">Save</button>
           <a class="ext" href="${w.url}" target="_blank" rel="noopener">Open in Azure DevOps</a>
@@ -1372,6 +1471,64 @@ async function openItem(id) {
   toggle(id, true);
 }
 
+// Screenshots pasted into a comment, per work item, pending the next Save.
+const shots = {};
+
+function renderShots(id) {
+  const box = document.getElementById("sh" + id);
+  if (!box) return;
+  const list = shots[id] || [];
+  box.innerHTML = list.map((s, i) => s.pending
+    ? `<span class="shot busy">Uploading ${esc(s.name)}...</span>`
+    : `<span class="shot"><img src="/img?n=${NONCE}&k=${encodeURIComponent(s.key)}"
+         alt="${esc(s.name)}" onclick="zoom(this.src)">
+       <a href="#" title="Remove from this comment"
+          onclick="event.preventDefault();dropShot(${id},${i})">&times;</a></span>`).join("");
+}
+
+function dropShot(id, i) {
+  // The file stays attached to the work item; this only unpicks it from the
+  // comment being written.
+  (shots[id] || []).splice(i, 1);
+  renderShots(id);
+}
+
+async function onPaste(ev, id) {
+  const files = [];
+  for (const it of (ev.clipboardData || {}).items || []) {
+    if (it.kind === "file" && it.type.indexOf("image/") === 0) {
+      const f = it.getAsFile();
+      if (f) files.push(f);
+    }
+  }
+  if (!files.length) return;   // plain text paste: leave it to the browser
+  ev.preventDefault();
+  const msg = document.getElementById("m" + id);
+  shots[id] = shots[id] || [];
+  for (const f of files) {
+    const ext = (f.type.split("/")[1] || "png").replace(/[^a-z0-9]/gi, "") || "png";
+    const name = "pasted-" + Date.now() + "." + ext;
+    const slot = {name: name, pending: true};
+    shots[id].push(slot);
+    renderShots(id);
+    try {
+      const r = await fetch(`/api/upload?id=${id}&name=${encodeURIComponent(name)}`
+                            + `&comment=${encodeURIComponent("Pasted into a comment")}`, {
+        method: "POST", body: f,
+        headers: {"x-ce-nonce": NONCE, "Content-Type": "application/octet-stream"},
+      });
+      const t = await r.text();
+      let d = {}; try { d = t ? JSON.parse(t) : {}; } catch (e) { d = {error: t}; }
+      if (!r.ok) throw new Error(d.error || r.status);
+      slot.pending = false; slot.url = d.url; slot.key = d.key; slot.name = d.name;
+    } catch (e) {
+      shots[id].splice(shots[id].indexOf(slot), 1);
+      if (msg) { msg.className = "msg err"; msg.textContent = "Paste failed: " + String(e.message || e); }
+    }
+    renderShots(id);
+  }
+}
+
 async function save(id) {
   const btn = document.getElementById("b" + id), msg = document.getElementById("m" + id);
   const w = items.find(x => x.id === id);
@@ -1379,19 +1536,23 @@ async function save(id) {
         state = document.getElementById("s" + id).value,
         who = document.getElementById("a" + id).value.trim(),
         comment = document.getElementById("c" + id).value;
+  const imgs = (shots[id] || []).filter(s => !s.pending && s.url).map(s => s.url);
   if (title && title !== w.title) fields["System.Title"] = title;
   if (state && state !== w.state) fields["System.State"] = state;
   if (who !== w.assignedTo) fields["System.AssignedTo"] = who;
-  if (!Object.keys(fields).length && !comment.trim()) { msg.className = "msg"; msg.textContent = "No changes."; return; }
+  if (!Object.keys(fields).length && !comment.trim() && !imgs.length) { msg.className = "msg"; msg.textContent = "No changes."; return; }
   btn.disabled = true; msg.className = "msg"; msg.textContent = "Saving...";
   // Only send people actually still referenced in the text.
   const mentions = (picked[id] || []).filter(p => comment.includes("@" + p.name));
   try {
-    await api("/api/item/" + id, {method: "POST", body: JSON.stringify({fields, comment, mentions})});
+    await api("/api/item/" + id, {method: "POST", body: JSON.stringify({fields, comment, mentions, images: imgs})});
     msg.className = "msg ok";
-    msg.textContent = "Saved." + (mentions.length ? ` Tagged ${mentions.length} person(s).` : "");
+    msg.textContent = "Saved." + (mentions.length ? ` Tagged ${mentions.length} person(s).` : "")
+                    + (imgs.length ? ` ${imgs.length} image(s) added.` : "");
     document.getElementById("c" + id).value = "";
     picked[id] = [];
+    shots[id] = [];
+    renderShots(id);
     await load(true);
     openItem(id);
   } catch (e) { msg.className = "msg err"; msg.textContent = String(e.message || e); }
@@ -1531,6 +1692,7 @@ function renderFeed(notes) {
   if (!notes.length) { box.classList.remove("show"); return; }
   box.classList.add("show");
   body.innerHTML = notes.map(n => `<div class="note" onclick="openItem(${n.workItemId})">
+      <span class="kind ${esc(n.kind || "comment")}">${esc(n.kind || "comment")}</span>
       <b>#${n.workItemId}</b> ${esc(n.title)}<br>
       <span class="meta">${esc(n.author)} &middot; ${esc((n.at || "").slice(0, 16).replace("T", " "))}</span><br>
       ${esc(n.text)}</div>`).join("");
@@ -1854,7 +2016,8 @@ def main():
         print("No cached sign-in yet - use the Sign in button on the page.")
     stop_event = threading.Event()
     if args.poll > 0:
-        print("Watching for new comments every {}s".format(args.poll))
+        print("Watching for comments, state changes and reassignments "
+              "every {}s".format(args.poll))
         threading.Thread(target=poll_comments, args=(args.poll, stop_event),
                          daemon=True).start()
     print("Press Ctrl+C to stop.")

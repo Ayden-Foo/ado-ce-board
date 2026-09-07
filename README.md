@@ -2,7 +2,8 @@
 
 A small local dashboard for triaging Azure DevOps work items and Customer
 Escalations: list them, open one, edit it, comment with @mentions, search the
-whole project, and get a desktop toast when someone replies.
+whole project, and get a desktop toast when someone replies, changes the
+state, or reassigns an item.
 
 Everything runs on your own machine. There is no server to host, no database,
 and no Personal Access Token.
@@ -43,11 +44,15 @@ Open the **CE Board** shortcut.
 | Open one | Click the row |
 | Change State / Assignee / Title | Expand the row, edit, **Save** |
 | Comment | Expand the row, type in the comment box, **Save** |
+| Add a screenshot to a comment | Paste it straight into the comment box; a thumbnail appears, **Save** posts it |
+| Resize the comment box | Drag its bottom-right corner; the size is remembered |
 | Tag a colleague | Type `@` plus 2+ letters and pick from the list |
 | Find an old case | Type a keyword or the ID, tick *include closed* |
 | Search someone else's items | Set the scope dropdown to *All of this project* |
 | See cases you follow | Set the scope dropdown to *Followed by me* |
 | Know when someone replies | A Windows toast appears; the item is listed in a banner |
+| Know when a state changes | Toast plus a `state` entry in the banner |
+| Know when something is assigned to you | Toast plus an `assigned` entry in the banner |
 | See a screenshot | Images in the description and comments render inline |
 | View an image full size | Click it; press `Esc` or click the backdrop to close |
 | Download an attachment | Expand the row, **Download** next to the file |
@@ -94,6 +99,10 @@ sees your password.
 - Attachments and inline images are fetched with your token by the board, and
   only from this organisation's Azure DevOps host. Redirects are not followed,
   so your token cannot be forwarded elsewhere.
+- Pasted screenshots are uploaded to the work item as normal Azure DevOps
+  attachments and embedded in the comment. Nothing is written to local disk.
+  A comment can only embed an image this tool itself uploaded in the same
+  session.
 - New-comment pop-ups include a short excerpt of the comment. Windows keeps
   notification history, so that excerpt persists in Windows' own store; turn
   polling off with `CE_BOARD_POLL=0` if that is not acceptable for the content
@@ -112,7 +121,7 @@ Set these before launching if you need something other than the defaults:
 | `AZDO_ORG` | `ni` | Azure DevOps organisation |
 | `AZDO_PROJECT` | `DevCentral` | Project |
 | `CE_BOARD_PORT` | `8787` | Local port |
-| `CE_BOARD_POLL` | `180` | Seconds between comment checks |
+| `CE_BOARD_POLL` | `180` | Seconds between checks for comments, state changes and reassignments |
 
 To change them permanently, re-run:
 
@@ -128,7 +137,7 @@ Useful if your team has to answer where escalation data ends up.
 | --- | --- |
 | `~/.azdo_cli_token.json` | Your Azure DevOps access + refresh token. **Sensitive.** |
 | `~/.azdo_ce_board_url` | The board's per-launch URL (contains the nonce). |
-| `~/.azdo_ce_seen.json` | Comment IDs already notified — numbers only, no text. |
+| `~/.azdo_ce_seen.json` | Comment IDs already notified, plus the last seen state and assignee per item, so a change can be detected. No comment text. |
 | `~/.azdo_ce_board.log` | Startup and error messages. No tokens, no comment text. |
 | `scripts\_ce_board_launch.cmd` | Your org/project/port. No credentials. |
 
