@@ -1024,6 +1024,8 @@ PAGE = r"""<!doctype html>
  label{display:block;font-size:12px;color:#656d76;margin:8px 0 3px}
  input,select,textarea{width:100%;padding:7px 9px;border:1px solid #d0d7de;border-radius:6px;font:inherit;background:#fff;color:inherit;box-sizing:border-box}
  textarea{min-height:64px;resize:vertical}
+.ctext{min-height:150px;max-height:60vh;line-height:1.5;resize:vertical;overflow-y:auto}
+.chint{float:right;font-size:11px;color:#8c959f;font-weight:400}
  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
  .acts{margin-top:12px;display:flex;gap:8px;align-items:center}
  button{background:#1f883d;color:#fff;border:0;padding:8px 16px;border-radius:6px;cursor:pointer;font:inherit;font-weight:500}
@@ -1183,9 +1185,13 @@ function render() {
           <div><label>Assigned to (email, blank to unassign)</label>
                <input id="a${w.id}" value="${esc(w.assignedTo)}"></div>
         </div>
-        <label>Comment (added to Discussion) &mdash; type @ to tag someone</label>
-        <div class="cwrap"><textarea id="c${w.id}" autocomplete="off"
-             oninput="onComment(${w.id})" onkeydown="mentionKey(event, ${w.id})"></textarea>
+        <label>Comment (added to Discussion) &mdash; type @ to tag someone
+          <span class="chint">drag the corner to resize &middot;
+            <a href="#" onclick="event.preventDefault();resetCH()">reset</a></span></label>
+        <div class="cwrap"><textarea id="c${w.id}" class="ctext" autocomplete="off"
+             oninput="onComment(${w.id}); grow(this)"
+             onmousedown="markH(this)" onmouseup="saveH(this)"
+             onkeydown="mentionKey(event, ${w.id})"></textarea>
           <div class="mbox" id="mb${w.id}"></div></div>
         <div class="acts">
           <button onclick="save(${w.id})" id="b${w.id}">Save</button>
@@ -1406,6 +1412,44 @@ function mentionQuery(box) {
   if (at > 0 && !/[\s(<]/.test(upto[at - 1])) return null;
   return {start: at, text: frag};
 }
+
+const CH_KEY = "ceCommentHeight";
+
+// A saved height is applied through a stylesheet rule so it covers every
+// comment box, including cards rendered later.
+function setCH(h) {
+  let s = document.getElementById("chstyle");
+  if (!s) { s = document.createElement("style"); s.id = "chstyle"; document.head.appendChild(s); }
+  s.textContent = h ? ".ctext{height:" + h + "}" : "";
+}
+
+function markH(el) { el.dataset.h0 = el.offsetHeight; }
+
+function saveH(el) {
+  const before = Number(el.dataset.h0 || 0);
+  if (!before || Math.abs(el.offsetHeight - before) < 3) return;  // a click, not a drag
+  const h = el.offsetHeight + "px";
+  el.style.height = "";
+  try { localStorage.setItem(CH_KEY, h); } catch (e) { /* private mode */ }
+  setCH(h);
+}
+
+function grow(el) {
+  let saved = null;
+  try { saved = localStorage.getItem(CH_KEY); } catch (e) { /* ignore */ }
+  if (saved) return;  // the user picked a size; leave it alone
+  el.style.height = "auto";
+  const max = Math.round(window.innerHeight * 0.6);
+  el.style.height = Math.min(el.scrollHeight + 2, max) + "px";
+}
+
+function resetCH() {
+  try { localStorage.removeItem(CH_KEY); } catch (e) { /* ignore */ }
+  setCH("");
+  document.querySelectorAll(".ctext").forEach(t => { t.style.height = ""; });
+}
+
+try { setCH(localStorage.getItem(CH_KEY)); } catch (e) { /* ignore */ }
 
 async function onComment(id) {
   const box = document.getElementById("c" + id);
