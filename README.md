@@ -46,6 +46,7 @@ Open the **CE Board** shortcut.
 | Comment | Expand the row, type in the comment box, **Save** |
 | Add a screenshot to a comment | Paste it straight into the comment box; a thumbnail appears, **Save** posts it |
 | Fix a comment you already posted | Click **edit** on your own comment in Discussion, change it, **Save comment** |
+| Add a table | Copy cells in Excel or a table in Outlook and paste into the comment box |
 | Resize the comment box | Drag its bottom-right corner; the size is remembered |
 | Tag a colleague | Type `@` plus 2+ letters and pick from the list |
 | Find an old case | Type a keyword or the ID, tick *include closed* |
@@ -100,8 +101,14 @@ sees your password.
 - Attachments and inline images are fetched with your token by the board, and
   only from this organisation's Azure DevOps host. Redirects are not followed,
   so your token cannot be forwarded elsewhere.
+- The comment editor has the same @mention, screenshot paste and table paste
+  as the new-comment box.
+- Pasted tables are stripped to plain rows and cells on the server: every
+  attribute except `colspan`/`rowspan` is discarded, and anything outside the
+  table is dropped. Excel's `<style>`/`<script>` blocks never reach the work
+  item. A comment can only embed a table the server itself built.
 - You can only edit your **own** comments; Azure DevOps enforces this and the
-  tool checks it too. Editing keeps any images already in that comment.
+  tool checks it too. Editing keeps any images and tables already in that comment.
   Azure DevOps records the edit, so the change is auditable.
 - Pasted screenshots are uploaded to the work item as normal Azure DevOps
   attachments and embedded in the comment. Nothing is written to local disk.

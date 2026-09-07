@@ -347,8 +347,11 @@ def update_item(item_id, changes):
             ops.append({"op": "add", "path": "/fields/" + field, "value": value})
     comment = (changes.get("comment") or "").strip()
     images = _allowed_images(changes.get("images"))
-    if comment or images:
+    tables = _allowed_tables(changes.get("tables"))
+    if comment or images or tables:
         html = build_comment_html(comment, changes.get("mentions"))
+        for table in tables:
+            html += ("<br>" if html else "") + table
         for src in images:
             if html:
                 html += "<br>"
@@ -576,6 +579,164 @@ def item_detail(item_id):
     }
 
 
+TABLE_TAGS = {"table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption",
+              "br", "b", "strong", "i", "em", "u", "p"}
+TABLE_VOID = {"br"}
+TABLE_STYLE = "border-collapse:collapse"
+CELL_STYLE = "border:1px solid #c0c0c0;padding:4px 8px;vertical-align:top"
+MAX_TABLE_ROWS = 200
+MAX_TABLE_COLS = 50
+MAX_CELL_CHARS = 500
+
+# Sanitised tables the server produced, keyed by an opaque token. A comment can
+# only embed a table this server built, so the page can never post raw HTML.
+_table_lock = threading.Lock()
+_tables = {}
+
+
+class _TableCleaner(HTMLParser):
+    """Reduce pasted Excel/Outlook HTML to a plain, safe table.
+
+    Everything outside a <table> is dropped, as are all attributes except
+    colspan/rowspan; the borders are styles this module owns, never anything
+    that came from the clipboard.
+    """
+
+    def __init__(self):
+        HTMLParser.__init__(self, convert_charrefs=True)
+        self.out = []
+        self.depth = 0        # nesting level of <table>
+        self.skip = 0         # inside <style>/<script>
+        self.stack = []
+        self.rows = 0
+        self.cols = 0
+        self._row_cols = 0
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in ("style", "script"):
+            self.skip += 1
+            return
+        if self.skip:
+            return
+        if tag == "table":
+            self.depth += 1
+            if self.depth > 1:      # a nested table is flattened away
+                return
+            self.out.append('<table style="{}">'.format(TABLE_STYLE))
+            self.stack.append(tag)
+            return
+        if not self.depth or tag not in TABLE_TAGS:
+            return
+        if tag == "tr":
+            if self.rows >= MAX_TABLE_ROWS:
+                return
+            self.rows += 1
+            self._row_cols = 0
+        if tag in ("td", "th"):
+            self._row_cols += 1
+            if self._row_cols > MAX_TABLE_COLS:
+                return
+            self.cols = max(self.cols, self._row_cols)
+            span = ""
+            for name, value in attrs:
+                if name.lower() in ("colspan", "rowspan") and value \
+                        and value.strip().isdigit():
+                    span += ' {}="{}"'.format(name.lower(),
+                                              min(int(value.strip()), 50))
+            self.out.append('<{}{} style="{}">'.format(tag, span, CELL_STYLE))
+        else:
+            self.out.append("<{}>".format(tag))
+        if tag not in TABLE_VOID:
+            self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in ("style", "script"):
+            self.skip = max(0, self.skip - 1)
+            return
+        if self.skip or not self.depth:
+            return
+        if tag == "table":
+            self.depth -= 1
+        if tag in TABLE_VOID or tag not in TABLE_TAGS:
+            return
+        if tag in self.stack:
+            while self.stack:
+                open_tag = self.stack.pop()
+                self.out.append("</{}>".format(open_tag))
+                if open_tag == tag:
+                    break
+
+    def handle_data(self, data):
+        if self.skip or not self.depth or not self.stack:
+            return
+        text = re.sub(r"\s+", " ", data)[:MAX_CELL_CHARS]
+        if text.strip() or text == " ":
+            self.out.append(_esc_html(text))
+
+    def result(self):
+        while self.stack:
+            self.out.append("</{}>".format(self.stack.pop()))
+        return "".join(self.out)
+
+
+def _table_from_tsv(text):
+    """Build a table from the tab-separated text Excel puts on the clipboard."""
+    lines = [ln for ln in (text or "").replace("\r\n", "\n")
+             .replace("\r", "\n").split("\n") if ln.strip()]
+    if not lines:
+        return "", 0, 0
+    cells = [ln.split("\t")[:MAX_TABLE_COLS] for ln in lines[:MAX_TABLE_ROWS]]
+    out = ['<table style="{}">'.format(TABLE_STYLE)]
+    for index, row in enumerate(cells):
+        tag = "th" if index == 0 else "td"
+        out.append("<tr>")
+        for cell in row:
+            out.append('<{0} style="{1}">{2}</{0}>'.format(
+                tag, CELL_STYLE, _esc_html(cell.strip()[:MAX_CELL_CHARS])))
+        out.append("</tr>")
+    out.append("</table>")
+    return "".join(out), len(cells), max(len(r) for r in cells)
+
+
+def make_table(html="", tsv=""):
+    """Turn pasted clipboard content into a stored, sanitised table."""
+    if html and "<table" in html.lower():
+        cleaner = _TableCleaner()
+        cleaner.feed(html)
+        cleaned, rows, cols = cleaner.result(), cleaner.rows, cleaner.cols
+    else:
+        cleaned, rows, cols = _table_from_tsv(tsv)
+    if not cleaned or not rows:
+        raise ApiError(400, "That paste did not contain a table.")
+    token = secrets.token_hex(16)
+    with _table_lock:
+        if len(_tables) > 200:
+            _tables.clear()
+        _tables[token] = cleaned
+    return {"token": token, "html": cleaned, "rows": rows, "cols": cols}
+
+
+def _allowed_tables(tokens):
+    """Resolve table tokens back to the HTML this server sanitised."""
+    out = []
+    for token in (tokens or [])[:10]:
+        with _table_lock:
+            html = _tables.get(str(token))
+        if html and html not in out:
+            out.append(html)
+    return out
+
+
+def _comment_tables(text):
+    """Tables already in a comment, re-cleaned, so an edit keeps them."""
+    cleaner = _TableCleaner()
+    cleaner.feed(text or "")
+    result = cleaner.result()
+    return result if cleaner.rows else ""
+
+
 def _comment_images(text):
     """Attachment images already embedded in a comment, so an edit keeps them.
 
@@ -603,10 +764,14 @@ def edit_comment(item_id, comment_id, changes):
     if mine_id and author and author != mine_id:
         raise ApiError(403, "Azure DevOps only lets you edit your own comments.")
     kept = _comment_images(existing.get("text", ""))
+    kept_tables = _comment_tables(existing.get("text", ""))
     added = [src for src in _allowed_images(changes.get("images"))
              if src not in kept]
     body = build_comment_html((changes.get("comment") or "").strip(),
                               changes.get("mentions"))
+    for table in ([kept_tables] if kept_tables else []) + _allowed_tables(
+            changes.get("tables")):
+        body += ("<br>" if body else "") + table
     for src in kept + added:
         if body:
             body += "<br>"
@@ -1186,6 +1351,11 @@ PAGE = r"""<!doctype html>
         text-align:center;border-radius:50%;background:#57606a;color:#fff;font-size:13px;
         text-decoration:none}
 .paste.busy{padding:6px 10px;font-size:12px;color:#57606a}
+.paste.tbl{flex-direction:column;align-items:stretch;padding:4px 6px;max-width:280px}
+.tprev{display:block;max-height:90px;max-width:268px;overflow:auto;font-size:10px}
+.tprev table{border-collapse:collapse}
+.tprev td,.tprev th{border:1px solid #d0d7de;padding:1px 4px;white-space:nowrap}
+.tcap{font-size:11px;color:#57606a;margin-top:3px}
 .kind{display:inline-block;font-size:10px;text-transform:uppercase;letter-spacing:.4px;
       border-radius:8px;padding:1px 7px;margin-right:6px;background:#ddf4ff;color:#0969da}
 .kind.state{background:#fff1e5;color:#bc4c00}
@@ -1354,10 +1524,10 @@ function render() {
           <span class="chint">drag the corner to resize &middot;
             <a href="#" onclick="event.preventDefault();resetCH()">reset</a></span></label>
         <div class="cwrap"><textarea id="c${w.id}" class="ctext" autocomplete="off"
-             oninput="onComment(${w.id}); grow(this)"
+             oninput="onComment('${w.id}'); grow(this)"
              onmousedown="markH(this)" onmouseup="saveH(this)"
-             onpaste="onPaste(event, ${w.id})"
-             onkeydown="mentionKey(event, ${w.id})"></textarea>
+             onpaste="onPaste(event, '${w.id}', ${w.id})"
+             onkeydown="mentionKey(event, '${w.id}')"></textarea>
           <div class="mbox" id="mb${w.id}"></div></div>
         <div class="pastes" id="pv${w.id}"></div>
         <div class="acts">
@@ -1458,38 +1628,62 @@ function editComment(id, cid) {
   if (!row || !d) return;
   const c = (d.comments || []).find(x => x.id === cid);
   if (!c || row.querySelector("textarea")) return;
+  // The editor reuses the new-comment element naming ("c"/"mb"/"pv"/"m"/"b"
+  // plus a key) so the @mention and paste helpers work here unchanged.
+  const k = id + "-" + cid;
   row.dataset.html = row.innerHTML;
   row.innerHTML =
-    `<span class="meta">${esc(c.author)} &middot; editing</span>
-     <textarea class="ctext" id="ce${id}-${cid}"
-        onmousedown="markH(this)" onmouseup="saveH(this)"></textarea>
+    `<span class="meta">${esc(c.author)} &middot; editing &mdash; type @ to tag
+       someone, paste a screenshot or a table</span>
+     <div class="cwrap"><textarea class="ctext" id="c${k}" autocomplete="off"
+        oninput="onComment('${k}'); grow(this)"
+        onmousedown="markH(this)" onmouseup="saveH(this)"
+        onpaste="onPaste(event, '${k}', ${id})"
+        onkeydown="mentionKey(event, '${k}')"></textarea>
+       <div class="mbox" id="mb${k}"></div></div>
+     <div class="pastes" id="pv${k}"></div>
      <div class="acts">
-       <button onclick="saveComment(${id},${cid})" id="cb${id}-${cid}">Save comment</button>
+       <button onclick="saveComment(${id},${cid})" id="b${k}">Save comment</button>
        <button class="sec" onclick="cancelComment(${id},${cid})">Cancel</button>
-       <span class="msg" id="cmsg${id}-${cid}"></span>
+       <span class="msg" id="m${k}"></span>
      </div>
-     <div class="meta">Images already in this comment are kept.</div>`;
-  const ta = document.getElementById("ce" + id + "-" + cid);
+     <div class="meta">Images and tables already in this comment are kept.</div>`;
+  picked[k] = [];
+  pasted[k] = [];
+  tabled[k] = [];
+  const ta = document.getElementById("c" + k);
   ta.value = c.text || "";
   ta.focus();
 }
 
 function cancelComment(id, cid) {
   const row = document.getElementById("cm" + id + "-" + cid);
+  const k = id + "-" + cid;
+  delete picked[k];
+  delete pasted[k];
+  delete tabled[k];
   if (row && row.dataset.html) row.innerHTML = row.dataset.html;
 }
 
 async function saveComment(id, cid) {
-  const ta = document.getElementById("ce" + id + "-" + cid);
-  const msg = document.getElementById("cmsg" + id + "-" + cid);
-  const btn = document.getElementById("cb" + id + "-" + cid);
+  const k = id + "-" + cid;
+  const ta = document.getElementById("c" + k);
+  const msg = document.getElementById("m" + k);
+  const btn = document.getElementById("b" + k);
   const text = (ta.value || "").trim();
-  if (!text) { msg.className = "msg err"; msg.textContent = "Comment cannot be empty."; return; }
+  const imgs = (pasted[k] || []).filter(s => !s.pending && s.url).map(s => s.url);
+  const tbls = (tabled[k] || []).map(t => t.token);
+  if (!text && !imgs.length && !tbls.length) { msg.className = "msg err"; msg.textContent = "Comment cannot be empty."; return; }
   btn.disabled = true; msg.className = "msg"; msg.textContent = "Saving...";
+  const mentions = (picked[k] || []).filter(p => text.includes("@" + p.name));
   const project = ((detailCache[id] || {}).item || {}).project || PROJECT;
   try {
     await api("/api/comment", {method: "POST", body: JSON.stringify(
-      {id: id, commentId: cid, comment: text, project: project})});
+      {id: id, commentId: cid, comment: text, mentions: mentions,
+       images: imgs, tables: tbls, project: project})});
+    delete picked[k];
+    delete pasted[k];
+    delete tabled[k];
     await loadDetail(id);
   } catch (e) {
     btn.disabled = false;
@@ -1592,48 +1786,91 @@ async function openItem(id) {
   toggle(id, true);
 }
 
-// Screenshots pasted into a comment, per work item, pending the next Save.
+// Screenshots and tables pasted into a comment, per box, pending the next Save.
 const pasted = {};
+const tabled = {};
 
-function renderPastes(id) {
-  const box = document.getElementById("pv" + id);
+function renderPastes(key) {
+  const box = document.getElementById("pv" + key);
   if (!box) return;
-  const list = pasted[id] || [];
-  box.innerHTML = list.map((s, i) => s.pending
+  const imgs = (pasted[key] || []).map((s, i) => s.pending
     ? `<span class="paste busy">Uploading ${esc(s.name)}...</span>`
     : `<span class="paste"><img src="/img?n=${NONCE}&k=${encodeURIComponent(s.key)}"
          alt="${esc(s.name)}" onclick="zoom(this.src)">
        <a href="#" title="Remove from this comment"
-          onclick="event.preventDefault();dropPaste(${id},${i})">&times;</a></span>`).join("");
+          onclick="event.preventDefault();dropPaste('${key}',${i})">&times;</a></span>`).join("");
+  // The preview is HTML the server already sanitised down to a bare table.
+  const tabs = (tabled[key] || []).map((t, i) =>
+    `<span class="paste tbl"><span class="tprev">${t.html}</span>
+       <span class="tcap">Table ${t.rows}&times;${t.cols}</span>
+       <a href="#" title="Remove from this comment"
+          onclick="event.preventDefault();dropTable('${key}',${i})">&times;</a></span>`).join("");
+  box.innerHTML = imgs + tabs;
 }
 
-function dropPaste(id, i) {
+function dropPaste(key, i) {
   // The file stays attached to the work item; this only unpicks it from the
   // comment being written.
-  (pasted[id] || []).splice(i, 1);
-  renderPastes(id);
+  (pasted[key] || []).splice(i, 1);
+  renderPastes(key);
 }
 
-async function onPaste(ev, id) {
+function dropTable(key, i) {
+  (tabled[key] || []).splice(i, 1);
+  renderPastes(key);
+}
+
+async function pasteTable(key, html, tsv) {
+  const msg = document.getElementById("m" + key);
+  try {
+    const d = await api("/api/table", {method: "POST",
+      body: JSON.stringify({html: html || "", tsv: tsv || ""})});
+    tabled[key] = tabled[key] || [];
+    tabled[key].push(d);
+    renderPastes(key);
+    if (msg) { msg.className = "msg ok"; msg.textContent = `Table ${d.rows}x${d.cols} attached to this comment.`; }
+    return true;
+  } catch (e) {
+    if (msg) { msg.className = "msg err"; msg.textContent = "Table paste failed: " + String(e.message || e); }
+    return false;
+  }
+}
+
+async function onPaste(ev, key, itemId) {
+  const cb = ev.clipboardData || {};
   const files = [];
-  for (const it of (ev.clipboardData || {}).items || []) {
+  for (const it of cb.items || []) {
     if (it.kind === "file" && it.type.indexOf("image/") === 0) {
       const f = it.getAsFile();
       if (f) files.push(f);
     }
   }
-  if (!files.length) return;   // plain text paste: leave it to the browser
+  if (!files.length) {
+    // Excel and Outlook put real HTML on the clipboard; Excel also offers a
+    // tab-separated fallback. Either becomes a table instead of flat text.
+    const html = cb.getData ? cb.getData("text/html") : "";
+    const plain = cb.getData ? cb.getData("text/plain") : "";
+    if (html && html.toLowerCase().indexOf("<table") >= 0) {
+      ev.preventDefault();
+      return pasteTable(key, html, "");
+    }
+    if (plain && plain.indexOf("\t") >= 0 && plain.indexOf("\n") >= 0) {
+      ev.preventDefault();
+      return pasteTable(key, "", plain);
+    }
+    return;   // ordinary text paste: leave it to the browser
+  }
   ev.preventDefault();
-  const msg = document.getElementById("m" + id);
-  pasted[id] = pasted[id] || [];
+  const msg = document.getElementById("m" + key);
+  pasted[key] = pasted[key] || [];
   for (const f of files) {
     const ext = (f.type.split("/")[1] || "png").replace(/[^a-z0-9]/gi, "") || "png";
     const name = "pasted-" + Date.now() + "." + ext;
     const slot = {name: name, pending: true};
-    pasted[id].push(slot);
-    renderPastes(id);
+    pasted[key].push(slot);
+    renderPastes(key);
     try {
-      const r = await fetch(`/api/upload?id=${id}&name=${encodeURIComponent(name)}`
+      const r = await fetch(`/api/upload?id=${itemId}&name=${encodeURIComponent(name)}`
                             + `&comment=${encodeURIComponent("Pasted into a comment")}`, {
         method: "POST", body: f,
         headers: {"x-ce-nonce": NONCE, "Content-Type": "application/octet-stream"},
@@ -1643,10 +1880,10 @@ async function onPaste(ev, id) {
       if (!r.ok) throw new Error(d.error || r.status);
       slot.pending = false; slot.url = d.url; slot.key = d.key; slot.name = d.name;
     } catch (e) {
-      pasted[id].splice(pasted[id].indexOf(slot), 1);
+      pasted[key].splice(pasted[key].indexOf(slot), 1);
       if (msg) { msg.className = "msg err"; msg.textContent = "Paste failed: " + String(e.message || e); }
     }
-    renderPastes(id);
+    renderPastes(key);
   }
 }
 
@@ -1658,21 +1895,24 @@ async function save(id) {
         who = document.getElementById("a" + id).value.trim(),
         comment = document.getElementById("c" + id).value;
   const imgs = (pasted[id] || []).filter(s => !s.pending && s.url).map(s => s.url);
+  const tbls = (tabled[id] || []).map(t => t.token);
   if (title && title !== w.title) fields["System.Title"] = title;
   if (state && state !== w.state) fields["System.State"] = state;
   if (who !== w.assignedTo) fields["System.AssignedTo"] = who;
-  if (!Object.keys(fields).length && !comment.trim() && !imgs.length) { msg.className = "msg"; msg.textContent = "No changes."; return; }
+  if (!Object.keys(fields).length && !comment.trim() && !imgs.length && !tbls.length) { msg.className = "msg"; msg.textContent = "No changes."; return; }
   btn.disabled = true; msg.className = "msg"; msg.textContent = "Saving...";
   // Only send people actually still referenced in the text.
   const mentions = (picked[id] || []).filter(p => comment.includes("@" + p.name));
   try {
-    await api("/api/item/" + id, {method: "POST", body: JSON.stringify({fields, comment, mentions, images: imgs})});
+    await api("/api/item/" + id, {method: "POST", body: JSON.stringify({fields, comment, mentions, images: imgs, tables: tbls})});
     msg.className = "msg ok";
     msg.textContent = "Saved." + (mentions.length ? ` Tagged ${mentions.length} person(s).` : "")
-                    + (imgs.length ? ` ${imgs.length} image(s) added.` : "");
+                    + (imgs.length ? ` ${imgs.length} image(s) added.` : "")
+                    + (tbls.length ? ` ${tbls.length} table(s) added.` : "");
     document.getElementById("c" + id).value = "";
     picked[id] = [];
     pasted[id] = [];
+    tabled[id] = [];
     renderPastes(id);
     await load(true);
     openItem(id);
@@ -1777,7 +2017,7 @@ function pickMention(index) {
 }
 
 function mentionKey(event, id) {
-  if (!mState || mState.id !== id) return;
+  if (!mState || String(mState.id) !== String(id)) return;
   if (event.key === "ArrowDown" || event.key === "ArrowUp") {
     event.preventDefault();
     const step = event.key === "ArrowDown" ? 1 : -1;
@@ -2064,6 +2304,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(400, "Bad work item id.")
                 remove_relation(item_id, payload.get("url", ""))
                 return self._send(200, json.dumps({"ok": True}))
+            if url.path == "/api/table":
+                return self._send(200, json.dumps(make_table(
+                    payload.get("html") or "", payload.get("tsv") or "")))
             if url.path == "/api/comment":
                 item_id = str(payload.get("id", ""))
                 comment_id = str(payload.get("commentId", ""))

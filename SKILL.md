@@ -255,6 +255,13 @@ work items or statuses.
 
 ## Security design (do not regress these)
 
+- Pasted tables go to `/api/table`, which runs `_TableCleaner` (an allowlist
+  HTMLParser: table tags only, `colspan`/`rowspan` only, `<style>`/`<script>`
+  bodies skipped, everything outside a `<table>` dropped) and stores the
+  result under an opaque token. Comments embed tables **by token only**
+  (`_allowed_tables`), so the page can never post raw HTML to a work item.
+  Borders come from module constants, never from the clipboard.
+
 - Identities are compared by GUID (`identity_id`, `my_identity_id`), never by
   display name: the profile says "Ayden Foo" while work item fields say
   "Foo, Ayden". Comment ownership, own-edit suppression and "assigned to you"
