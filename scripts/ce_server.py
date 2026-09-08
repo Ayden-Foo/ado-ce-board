@@ -721,8 +721,13 @@ class _TableCleaner(HTMLParser):
         if self.skip or not self.depth or not self.stack:
             return
         text = re.sub(r"\s+", " ", data)[:MAX_CELL_CHARS]
-        if text.strip() or text == " ":
-            self.out.append(_esc_html(text))
+        if not text.strip():
+            # Space between one cell and the next is only how the markup was
+            # laid out. Inside a cell it can be a real space between words.
+            if "td" not in self.stack and "th" not in self.stack:
+                return
+            text = " "
+        self.out.append(_esc_html(text))
 
     def result(self):
         while self.stack:
@@ -759,12 +764,18 @@ def make_table(html="", tsv=""):
         cleaned, rows, cols = _table_from_tsv(tsv)
     if not cleaned or not rows:
         raise ApiError(400, "That paste did not contain a table.")
+    token = _register_table(cleaned)
+    return {"token": token, "html": cleaned, "rows": rows, "cols": cols}
+
+
+def _register_table(html):
+    """Keep a sanitised table under an opaque token the page can refer to."""
     token = secrets.token_hex(16)
     with _table_lock:
         if len(_tables) > 200:
             _tables.clear()
-        _tables[token] = cleaned
-    return {"token": token, "html": cleaned, "rows": rows, "cols": cols}
+        _tables[token] = html
+    return token
 
 
 def _allowed_tables(tokens):
@@ -782,8 +793,203 @@ def _comment_tables(text):
     """Tables already in a comment, re-cleaned, so an edit keeps them."""
     cleaner = _TableCleaner()
     cleaner.feed(text or "")
-    result = cleaner.result()
-    return result if cleaner.rows else ""
+    return _split_tables(cleaner.result()) if cleaner.rows else []
+
+
+def _split_tables(html):
+    """Separate one cleaned run of HTML into its individual tables.
+
+    _TableCleaner flattens nested tables, so its output never has a <table>
+    inside another one and this split is exact rather than a guess.
+    """
+    return re.findall(r"<table\b.*?</table>", html or "", re.S)
+
+
+class _TableGrid(HTMLParser):
+    """Read a table this server built back into editable rows and cells.
+
+    Only ever fed _TableCleaner output, so the shape is known. Each cell keeps
+    its sanitised inner HTML, which is what lets a row be added or removed
+    without flattening the formatting of the cells nobody touched.
+    """
+
+    KEEP = ("b", "strong", "i", "em", "u", "p")
+    SECTIONS = ("thead", "tbody", "tfoot")
+
+    def __init__(self):
+        HTMLParser.__init__(self, convert_charrefs=True)
+        self.rows = []
+        self._row = None
+        self._cell = None
+        self._sect = None
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in self.SECTIONS:
+            self._sect = tag
+            return
+        if tag == "tr":
+            self._row = []
+            self.rows.append({"sect": self._sect, "cells": self._row})
+            return
+        if tag in ("td", "th"):
+            if self._row is None:
+                self._row = []
+                self.rows.append(self._row)
+            span = ""
+            for name, value in attrs:
+                if name.lower() in ("colspan", "rowspan") \
+                        and (value or "").strip().isdigit():
+                    span += ' {}="{}"'.format(name.lower(),
+                                              min(int(value.strip()), 50))
+            self._cell = {"tag": tag, "span": span, "inner": [], "text": []}
+            self._row.append(self._cell)
+            return
+        if self._cell is None:
+            return
+        if tag == "br":
+            self._cell["inner"].append("<br>")
+            self._cell["text"].append("\n")
+        elif tag in self.KEEP:
+            self._cell["inner"].append("<{}>".format(tag))
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in self.SECTIONS:
+            self._sect = None
+        elif tag in ("td", "th"):
+            self._cell = None
+        elif tag == "tr":
+            self._row = None
+        elif self._cell is not None and tag in self.KEEP:
+            self._cell["inner"].append("</{}>".format(tag))
+
+    def handle_data(self, data):
+        if self._cell is None:
+            return
+        self._cell["inner"].append(_esc_html(data))
+        self._cell["text"].append(data)
+
+    def result(self):
+        grid = []
+        for row in self.rows:
+            cells = [{"tag": c["tag"], "span": c["span"],
+                      "inner": "".join(c["inner"]),
+                      "text": "".join(c["text"])} for c in row["cells"]]
+            if cells:
+                grid.append({"sect": row["sect"], "cells": cells})
+        return grid
+
+
+def _blank_cell(tag="td"):
+    return {"tag": tag, "span": "", "inner": "", "text": ""}
+
+
+def _cell_inner(text):
+    """Turn what someone typed into a cell into safe cell HTML."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"[ \t]+", " ", line).strip()
+             for line in text[:MAX_CELL_CHARS].split("\n")]
+    while lines and not lines[-1]:
+        lines.pop()
+    return "<br>".join(_esc_html(line) for line in lines)
+
+
+def _grid_html(grid):
+    """Rebuild a table from its cells, with this module's own borders.
+
+    The thead/tbody grouping of the original is put back as it was, so a table
+    that is opened and saved without being changed comes out byte for byte the
+    way it went in.
+    """
+    out = ['<table style="{}">'.format(TABLE_STYLE)]
+    section = None
+    for row in grid[:MAX_TABLE_ROWS]:
+        if row["sect"] != section:
+            if section:
+                out.append("</{}>".format(section))
+            section = row["sect"]
+            if section:
+                out.append("<{}>".format(section))
+        out.append("<tr>")
+        for cell in row["cells"][:MAX_TABLE_COLS]:
+            out.append('<{0}{1} style="{2}">{3}</{0}>'.format(
+                cell["tag"], cell["span"], CELL_STYLE, cell["inner"]))
+        out.append("</tr>")
+    if section:
+        out.append("</{}>".format(section))
+    out.append("</table>")
+    return "".join(out)
+
+
+TABLE_OPS = ("setCell", "addRow", "delRow", "addCol", "delCol")
+
+
+def table_op(token, op, row=0, col=0, text=""):
+    """Apply one structural change to a stored table and store the result.
+
+    The page sends what it wants done -- add a row, retype a cell -- never the
+    table itself, so an edited table is still markup this server wrote. Cells
+    nobody touched keep their existing formatting with them.
+    """
+    if op not in TABLE_OPS:
+        raise ApiError(400, "Unknown table change: {}".format(op))
+    with _table_lock:
+        html = _tables.get(str(token or ""))
+    if not html:
+        raise ApiError(400, "That table is no longer open for editing. "
+                            "Reload the work item and try again.")
+    parser = _TableGrid()
+    parser.feed(html)
+    grid = parser.result()
+    if not grid:
+        raise ApiError(400, "That table has no rows to change.")
+    width = max(len(r["cells"]) for r in grid)
+    try:
+        row = max(0, min(int(row), len(grid) - 1))
+        col = max(0, min(int(col), width - 1))
+    except (TypeError, ValueError):
+        raise ApiError(400, "Bad row or column.")
+    if op == "setCell":
+        if col >= len(grid[row]["cells"]):
+            raise ApiError(400, "That cell is not in the table.")
+        grid[row]["cells"][col]["inner"] = _cell_inner(text)
+    elif op == "addRow":
+        if len(grid) >= MAX_TABLE_ROWS:
+            raise ApiError(400, "A table here is limited to {} rows."
+                                .format(MAX_TABLE_ROWS))
+        # A row added under the header belongs to the body, not the header.
+        sect = grid[row]["sect"]
+        if sect == "thead":
+            sect = grid[row + 1]["sect"] if row + 1 < len(grid) else "tbody"
+        grid.insert(row + 1, {"sect": sect,
+                              "cells": [_blank_cell() for _ in range(width)]})
+    elif op == "delRow":
+        if len(grid) <= 1:
+            raise ApiError(400, "Remove the whole table rather than its last "
+                                "row.")
+        grid.pop(row)
+    elif op == "addCol":
+        if width >= MAX_TABLE_COLS:
+            raise ApiError(400, "A table here is limited to {} columns."
+                                .format(MAX_TABLE_COLS))
+        for line in grid:
+            cells = line["cells"]
+            tag = cells[0]["tag"] if cells else "td"
+            cells.insert(min(col + 1, len(cells)), _blank_cell(tag))
+    elif op == "delCol":
+        if width <= 1:
+            raise ApiError(400, "Remove the whole table rather than its last "
+                                "column.")
+        for line in grid:
+            if col < len(line["cells"]):
+                line["cells"].pop(col)
+        grid = [line for line in grid if line["cells"]]
+        if not grid:
+            raise ApiError(400, "That would leave nothing of the table.")
+    built = _grid_html(grid)
+    return {"token": _register_table(built), "html": built, "rows": len(grid),
+            "cols": max(len(r["cells"]) for r in grid)}
 
 
 def _comment_images(text):
@@ -818,8 +1024,27 @@ def _kept_preview(text):
                 break
         images.append({"key": res_key(src),
                        "name": name or "Image {}".format(i + 1)})
-    table = _comment_tables(text)
-    return {"images": images, "tables": [table] if table else []}
+    tables = [{"token": _register_table(html), "html": html}
+              for html in _comment_tables(text)]
+    return {"images": images, "tables": tables}
+
+
+def _tables_for_edit(current, changes):
+    """Decide which tables an edit ends up with.
+
+    A page that understands table editing sends back the tokens of the tables
+    it still wants, which is how a deleted row stays deleted. Anything else and
+    the tables already in the field are carried over exactly as they were, so
+    an older page cannot quietly drop them by saying nothing. Either way every
+    table is markup this server built and stored itself.
+    """
+    chosen = changes.get("keptTables")
+    tables = (_allowed_tables(chosen) if chosen is not None
+              else _comment_tables(current))
+    for table in _allowed_tables(changes.get("tables")):
+        if table not in tables:
+            tables.append(table)
+    return tables
 
 
 def _own_comment_path(item_id, comment_id, project):
@@ -852,13 +1077,11 @@ def edit_comment(item_id, comment_id, changes):
     path, existing = _own_comment_path(item_id, comment_id,
                                        changes.get("project"))
     kept = _comment_images(existing.get("text", ""))
-    kept_tables = _comment_tables(existing.get("text", ""))
     added = [src for src in _allowed_images(changes.get("images"))
              if src not in kept]
     body = build_comment_html((changes.get("comment") or "").strip(),
                               changes.get("mentions"))
-    for table in ([kept_tables] if kept_tables else []) + _allowed_tables(
-            changes.get("tables")):
+    for table in _tables_for_edit(existing.get("text", ""), changes):
         body += ("<br>" if body else "") + table
     for src in kept + added:
         if body:
@@ -889,11 +1112,9 @@ def edit_description(item_id, changes):
         urllib.parse.quote(project), int(item_id), API)
     current = (call(base).get("fields") or {}).get(field, "") or ""
     kept = _comment_images(current)
-    kept_tables = _comment_tables(current)
     body = build_comment_html((changes.get("text") or "").strip(),
                               changes.get("mentions"))
-    for table in ([kept_tables] if kept_tables else []) + _allowed_tables(
-            changes.get("tables")):
+    for table in _tables_for_edit(current, changes):
         body += ("<br>" if body else "") + table
     added = [src for src in _allowed_images(changes.get("images"))
              if src not in kept]
@@ -1648,6 +1869,15 @@ PAGE = r"""<!doctype html>
  .rich p{margin:6px 0}
  .rich a{color:#0969da}
  .pastes.kept{margin-top:2px}
+    .paste.tbl.tedit{max-width:100%;background:#fff}
+    .tedit .tprev{max-height:280px;max-width:100%;font-size:12px}
+    .tedit .tprev td,.tedit .tprev th{white-space:pre-wrap;min-width:46px;padding:2px 6px}
+    .tedit .tprev td:focus,.tedit .tprev th:focus{outline:2px solid #0969da}
+    .tedit .cellsel{background:#ddf4ff}
+    .ttools{display:flex;gap:12px;margin-top:5px;font-size:11px;align-items:center}
+    .ttools a{color:#0969da;text-decoration:none}
+    .ttools a:hover{text-decoration:underline}
+    .ttools a.warn{color:#cf222e;margin-left:auto}
 .pastes.kept .paste{opacity:.85}
 .pastes.kept img{cursor:zoom-in}
 .shots{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0 12px}
@@ -1889,7 +2119,7 @@ function editComment(id, cid) {
         onkeydown="mentionKey(event, '${k}')"></textarea>
        <div class="mbox" id="mb${k}"></div></div>
      <div class="pastes" id="pv${k}"></div>
-     ${keptStrip(c.kept)}
+     ${keptStrip(c.kept, k)}
      <div class="acts">
        <button onclick="saveComment(${id},${cid})" id="b${k}">Save comment</button>
        <button class="sec" onclick="cancelComment(${id},${cid})">Cancel</button>
@@ -1898,6 +2128,7 @@ function editComment(id, cid) {
   picked[k] = [];
   pasted[k] = [];
   tabled[k] = [];
+  paintKept(k);
   const ta = document.getElementById("c" + k);
   ta.value = c.text || "";
   ta.focus();
@@ -1906,17 +2137,30 @@ function editComment(id, cid) {
 // What is already attached to the comment being edited. Shown so a screenshot
 // is visible while you type instead of only described. Read-only: the server
 // re-reads these from Azure DevOps and carries them over on its own.
-function keptStrip(kept) {
-  const imgs = ((kept || {}).images) || [];
-  const tabs = ((kept || {}).tables) || [];
-  if (!imgs.length && !tabs.length) return "";
-  const shown = imgs.map(im =>
-    `<span class="paste"><img src="/img?n=${NONCE}&k=${encodeURIComponent(im.key)}"
-       alt="${esc(im.name)}" title="${esc(im.name)}" onclick="zoom(this.src)"></span>`).join("")
-    // Already sanitised to a bare table by the server.
-    + tabs.map(t => `<span class="paste tbl"><span class="tprev">${t}</span></span>`).join("");
-  return `<div class="meta">Already in this comment &mdash; kept when you save</div>
-          <div class="pastes kept">${shown}</div>`;
+function keptStrip(kept, key) {
+  const k = kept || {};
+  keptImgs[key] = (k.images || []).slice();
+  kepts[key] = (k.tables || []).slice();
+  return `<div id="kw${key}"></div>`;
+}
+
+// Painted rather than returned as a string, because the tables inside are
+// live: removing one, or a row of one, has to redraw just this part.
+function paintKept(key) {
+  const box = document.getElementById("kw" + key);
+  if (!box) return;
+  const imgs = keptImgs[key] || [], tabs = kepts[key] || [];
+  if (!imgs.length && !tabs.length) { box.innerHTML = ""; return; }
+  const note = tabs.length
+    ? "Already here &mdash; images are kept as they are, tables can be edited"
+    : "Already in this comment &mdash; kept when you save";
+  box.innerHTML = `<div class="meta">${note}</div><div class="pastes kept">`
+    + imgs.map(im =>
+      `<span class="paste"><img src="/img?n=${NONCE}&k=${encodeURIComponent(im.key)}"
+         alt="${esc(im.name)}" title="${esc(im.name)}" onclick="zoom(this.src)"></span>`).join("")
+    + tabs.map((t, i) => tblHost("kept", key, i)).join("")
+    + `</div>`;
+  drawTables("kept", key);
 }
 
 async function deleteComment(id, cid) {
@@ -1954,7 +2198,7 @@ function editDesc(id) {
         onkeydown="mentionKey(event, '${k}')"></textarea>
        <div class="mbox" id="mb${k}"></div></div>
      <div class="pastes" id="pv${k}"></div>
-     ${keptStrip(repro ? it.reproKept : it.descKept)}
+     ${keptStrip(repro ? it.reproKept : it.descKept, k)}
      <div class="acts">
        <button onclick="saveDesc(${id})" id="b${k}">Save description</button>
        <button class="sec" onclick="cancelDesc(${id})">Cancel</button>
@@ -1963,6 +2207,7 @@ function editDesc(id) {
   picked[k] = [];
   pasted[k] = [];
   tabled[k] = [];
+  paintKept(k);
   const ta = document.getElementById("c" + k);
   ta.value = (repro ? it.repro : it.description) || "";
   grow(ta);
@@ -1975,6 +2220,8 @@ function cancelDesc(id) {
   delete picked[k];
   delete pasted[k];
   delete tabled[k];
+  delete kepts[k];
+  delete keptImgs[k];
   if (box && box.dataset.html) box.innerHTML = box.dataset.html;
 }
 
@@ -1987,8 +2234,7 @@ async function saveDesc(id) {
   const text = (ta.value || "").trim();
   const imgs = (pasted[k] || []).filter(s => !s.pending && s.url).map(s => s.url);
   const tbls = (tabled[k] || []).map(t => t.token);
-  const kept = (it.descField === "System.Description" ? it.descKept : it.reproKept) || {};
-  const keeps = (kept.images || []).length + (kept.tables || []).length;
+  const keeps = (keptImgs[k] || []).length + (kepts[k] || []).length;
   if (!text && !imgs.length && !tbls.length && !keeps
       && !confirm("Clear the description of work item " + id + " completely?")) return;
   btn.disabled = true; msg.className = "msg"; msg.textContent = "Saving...";
@@ -1996,7 +2242,8 @@ async function saveDesc(id) {
   try {
     await api("/api/description", {method: "POST", body: JSON.stringify(
       {id: id, field: it.descField, text: text, mentions: mentions,
-       images: imgs, tables: tbls, project: it.project || PROJECT})});
+       images: imgs, tables: tbls, project: it.project || PROJECT,
+       keptTables: (kepts[k] || []).map(t => t.token)})});
     delete picked[k];
     delete pasted[k];
     delete tabled[k];
@@ -2013,6 +2260,8 @@ function cancelComment(id, cid) {
   delete picked[k];
   delete pasted[k];
   delete tabled[k];
+  delete kepts[k];
+  delete keptImgs[k];
   if (row && row.dataset.html) row.innerHTML = row.dataset.html;
 }
 
@@ -2031,7 +2280,8 @@ async function saveComment(id, cid) {
   try {
     await api("/api/comment", {method: "POST", body: JSON.stringify(
       {id: id, commentId: cid, comment: text, mentions: mentions,
-       images: imgs, tables: tbls, project: project})});
+       images: imgs, tables: tbls, project: project,
+       keptTables: (kepts[k] || []).map(t => t.token)})});
     delete picked[k];
     delete pasted[k];
     delete tabled[k];
@@ -2146,6 +2396,120 @@ async function openItem(id) {
 // Screenshots and tables pasted into a comment, per box, pending the next Save.
 const pasted = {};
 const tabled = {};
+// The images and tables a comment already had, while it is being edited.
+const keptImgs = {};
+const kepts = {};
+// Which cell each drawn table has selected, so the row and column buttons
+// have something to act on.
+const tgState = {};
+
+function tblId(kind, key, i) { return "tg-" + kind + "-" + key + "-" + i; }
+
+function tblList(kind, key) {
+  return (kind === "kept" ? kepts[key] : tabled[key]) || [];
+}
+
+function tblHost(kind, key, i) {
+  return `<span class="paste tbl tedit" id="${tblId(kind, key, i)}"></span>`;
+}
+
+function drawTables(kind, key) {
+  tblList(kind, key).forEach((t, i) => {
+    const gid = tblId(kind, key, i), was = tgState[gid] || {};
+    tgState[gid] = {kind: kind, key: key, i: i,
+                    row: was.row || 0, col: was.col || 0};
+    drawTable(gid);
+  });
+}
+
+// The page never builds table markup of its own: it shows what the server
+// sent, asks for a change, and redraws whatever comes back.
+function drawTable(gid) {
+  const st = tgState[gid], host = document.getElementById(gid);
+  if (!st || !host) return;
+  const t = tblList(st.kind, st.key)[st.i];
+  if (!t) return;
+  host.innerHTML =
+    `<span class="tprev"></span>
+     <span class="tcap" id="cap${gid}"></span>
+     <span class="ttools">
+       <a href="#" title="Insert a row below the cell you clicked"
+          onclick="event.preventDefault();tblOp('${gid}','addRow')">+ row</a>
+       <a href="#" title="Delete the row of the cell you clicked"
+          onclick="event.preventDefault();tblOp('${gid}','delRow')">&minus; row</a>
+       <a href="#" title="Insert a column right of the cell you clicked"
+          onclick="event.preventDefault();tblOp('${gid}','addCol')">+ column</a>
+       <a href="#" title="Delete the column of the cell you clicked"
+          onclick="event.preventDefault();tblOp('${gid}','delCol')">&minus; column</a>
+       <a href="#" class="warn" title="Take this table out of the text"
+          onclick="event.preventDefault();dropTableAt('${gid}')">remove table</a>
+     </span>`;
+  const area = host.querySelector(".tprev");
+  area.innerHTML = t.html;      // markup this server sanitised and stored
+  const table = area.querySelector("table");
+  if (!table) return;
+  const rows = Array.from(table.rows);
+  if (st.row >= rows.length) st.row = rows.length - 1;
+  rows.forEach((tr, ri) => Array.from(tr.cells).forEach((cell, ci) => {
+    cell.contentEditable = "true";
+    cell.spellcheck = false;
+    cell.dataset.was = cell.innerText;
+    cell.onfocus = () => { st.row = ri; st.col = ci; markCell(gid); };
+    cell.onblur = () => {
+      if (cell.innerText !== cell.dataset.was) tblOp(gid, "setCell", cell.innerText);
+    };
+    cell.onkeydown = (e) => {
+      if (e.key === "Escape") { cell.innerText = cell.dataset.was; cell.blur(); }
+    };
+    // Only the text of a paste is taken, so pasting into a cell cannot carry
+    // markup in with it.
+    cell.onpaste = (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const cb = e.clipboardData || window.clipboardData;
+      document.execCommand("insertText", false, cb ? cb.getData("text") : "");
+    };
+  }));
+  markCell(gid);
+}
+
+function markCell(gid) {
+  const st = tgState[gid], host = document.getElementById(gid);
+  if (!st || !host) return;
+  const t = tblList(st.kind, st.key)[st.i];
+  const cap = document.getElementById("cap" + gid);
+  if (!t || !cap) return;
+  cap.textContent = `Table ${t.rows}x${t.cols} \u2014 row ${(st.row || 0) + 1}`
+                    + `, column ${(st.col || 0) + 1}`;
+  host.querySelectorAll(".cellsel").forEach(c => c.classList.remove("cellsel"));
+  const table = host.querySelector("table");
+  const tr = table && table.rows[st.row || 0];
+  const cell = tr && tr.cells[st.col || 0];
+  if (cell) cell.classList.add("cellsel");
+}
+
+async function tblOp(gid, op, text) {
+  const st = tgState[gid];
+  if (!st) return;
+  const list = tblList(st.kind, st.key), t = list[st.i];
+  if (!t) return;
+  try {
+    const d = await api("/api/table/op", {method: "POST", body: JSON.stringify(
+      {token: t.token, op: op, row: st.row || 0, col: st.col || 0,
+       text: text || ""})});
+    list[st.i] = d;
+  } catch (e) {
+    alert("Could not change the table: " + String(e.message || e));
+  }
+  drawTable(gid);   // redraw either way, so a refused change is undone on screen
+}
+
+function dropTableAt(gid) {
+  const st = tgState[gid];
+  if (!st) return;
+  if (!confirm("Remove this table from the text?\n\nIt goes when you save.")) return;
+  tblList(st.kind, st.key).splice(st.i, 1);
+  if (st.kind === "kept") paintKept(st.key); else renderPastes(st.key);
+}
 
 function renderPastes(key) {
   const box = document.getElementById("pv" + key);
@@ -2156,24 +2520,15 @@ function renderPastes(key) {
          alt="${esc(s.name)}" onclick="zoom(this.src)">
        <a href="#" title="Remove from this comment"
           onclick="event.preventDefault();dropPaste('${key}',${i})">&times;</a></span>`).join("");
-  // The preview is HTML the server already sanitised down to a bare table.
-  const tabs = (tabled[key] || []).map((t, i) =>
-    `<span class="paste tbl"><span class="tprev">${t.html}</span>
-       <span class="tcap">Table ${t.rows}&times;${t.cols}</span>
-       <a href="#" title="Remove from this comment"
-          onclick="event.preventDefault();dropTable('${key}',${i})">&times;</a></span>`).join("");
+  const tabs = (tabled[key] || []).map((t, i) => tblHost("new", key, i)).join("");
   box.innerHTML = imgs + tabs;
+  drawTables("new", key);
 }
 
 function dropPaste(key, i) {
   // The file stays attached to the work item; this only unpicks it from the
   // comment being written.
   (pasted[key] || []).splice(i, 1);
-  renderPastes(key);
-}
-
-function dropTable(key, i) {
-  (tabled[key] || []).splice(i, 1);
   renderPastes(key);
 }
 
@@ -2676,6 +3031,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(400, "Bad work item id.")
                 remove_relation(item_id, payload.get("url", ""))
                 return self._send(200, json.dumps({"ok": True}))
+            if url.path == "/api/table/op":
+                return self._send(200, json.dumps(table_op(
+                    payload.get("token"), payload.get("op") or "",
+                    payload.get("row") or 0, payload.get("col") or 0,
+                    payload.get("text") or "")))
             if url.path == "/api/table":
                 return self._send(200, json.dumps(make_table(
                     payload.get("html") or "", payload.get("tsv") or "")))

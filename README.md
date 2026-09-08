@@ -49,6 +49,8 @@ Open the **CE Board** shortcut.
 | Delete a comment you posted | Click **delete** on your own comment; it asks first |
 | Fix the case description | Click **edit** next to Description, change it, **Save description** |
 | Add a table | Copy cells in Excel or a table in Outlook and paste into the comment box |
+| Change a table | Click a cell and type; use **+ row**, **- row**, **+ column**, **- column** |
+| Take a table out | Click **remove table** under it, then Save |
 | Resize the comment box | Drag its bottom-right corner; the size is remembered |
 | Tag a colleague | Type `@` plus 2+ letters and pick from the list |
 | Find an old case | Type a keyword or the ID, tick *include closed* |
@@ -108,8 +110,18 @@ sees your password.
 - The comment editor has the same @mention, screenshot paste and table paste
   as the new-comment box.
 - While editing, any screenshots and tables already in that comment are shown
-  under **Already in this comment**, so you can see what you are keeping.
-  Click a thumbnail to enlarge it. They are carried over automatically.
+  underneath, so you can see what you are keeping. Click a thumbnail to
+  enlarge it. Screenshots are carried over as they are.
+- **Tables can be edited in place.** Click a cell and type to change it, and
+  use the links under the table to add or delete the row or column of the cell
+  you clicked, or to remove the table. The page never sends table markup: it
+  asks the server for the change and redraws what comes back, so an edited
+  table is still markup the server built. Cells you do not touch keep their
+  formatting, and a table you open and save without changing comes out exactly
+  as it went in. Nothing is written to Azure DevOps until you press Save.
+- Typing in a cell replaces just that cell, so any bold or colour it had is
+  lost -- as in the text box, cells are edited as plain text. Merged cells are
+  preserved, but a row or column added next to them is a plain one.
 - Pasted tables are stripped to plain rows and cells on the server: every
   attribute except `colspan`/`rowspan` is discarded, and anything outside the
   table is dropped. Excel's `<style>`/`<script>` blocks never reach the work
