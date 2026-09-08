@@ -64,6 +64,7 @@ Open the **CE Board** shortcut.
 | Link a related case | Pick the link type, enter the work item ID, **Add link** |
 | Link a web page | Choose *Hyperlink (URL)*, paste the URL, **Add link** |
 | Detach a file or link | **Remove** on its row (asks first) |
+| Start the board | The **CE Board** icon on your Desktop or Start Menu |
 
 Screenshots are the whole point of most CEs, so they render in place. Azure
 DevOps keeps attachments behind an authenticated URL that a browser cannot fetch
@@ -132,6 +133,12 @@ sees your password.
   notification history, so that excerpt persists in Windows' own store; turn
   polling off with `CE_BOARD_POLL=0` if that is not acceptable for the content
   you handle.
+- The Desktop shortcut runs the ordinary, Microsoft-signed `pythonw.exe`
+  that is already on the machine, and wears its own icon (drawn by
+  `scripts/make_icon.py`, no image library needed). It is deliberately not
+  a standalone `.exe`: endpoint protection on locked-down machines kills a
+  renamed copy of a signed interpreter, and a bundled one-file build would
+  be unsigned. A shortcut avoids both problems.
 - You can only see and change what your Azure DevOps account already permits.
   All work item rules are still enforced by Azure DevOps.
 

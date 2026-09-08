@@ -16,6 +16,8 @@ import os
 import subprocess
 import sys
 
+import make_icon
+
 TASK_NAME = "ADO CE Board"
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER = os.path.join(HERE, "ce_server.py")
@@ -91,7 +93,11 @@ def uninstall():
 def make_shortcuts(port):
     """Desktop + Start Menu shortcuts so the board opens like any other app."""
     target = os.path.join(HERE, "open_board.py")
-    icon = os.path.join(os.path.dirname(sys.executable), "python.exe")
+    # Its own icon if one can be drawn, otherwise the interpreter's. The
+    # shortcut still launches the signed pythonw.exe: a renamed copy of that
+    # binary is blocked by endpoint policy on locked-down machines.
+    icon = (make_icon.ensure(HERE)
+            or os.path.join(os.path.dirname(sys.executable), "python.exe"))
     made = []
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
     programs = os.path.join(os.environ.get("APPDATA", ""), "Microsoft",
