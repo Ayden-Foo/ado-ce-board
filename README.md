@@ -48,6 +48,10 @@ Open the **CE Board** shortcut.
 | Fix a comment you already posted | Click **edit** on your own comment in Discussion, change it, **Save comment** |
 | Delete a comment you posted | Click **delete** on your own comment; it asks first |
 | Fix the case description | Click **edit** next to Description, change it, **Save description** |
+| Bold, italic, underline | The buttons above the box, or `Ctrl+B` / `Ctrl+I` / `Ctrl+U` |
+| Highlight a phrase | Select it and click the yellow **A**; click again to clear it |
+| Make a list | The **&bull; list** or **1. list** button |
+| Indent a line | `Tab`, or the arrow buttons; `Shift+Tab` goes back |
 | Add a table | Copy cells in Excel or a table in Outlook and paste into the comment box |
 | Change a table | Click a cell and type; use **+ row**, **- row**, **+ column**, **- column** |
 | Take a table out | Click **remove table** under it, then Save |
@@ -152,8 +156,21 @@ sees your password.
   to your default browser.
 - Editing keeps the **layout**: line breaks, blank lines between paragraphs
   and bulleted or numbered lists survive the round trip, and editing the same
-  text twice does not shift it. Bold and colour are not kept -- the editor is
-  plain text -- so what you see in the box is what will be saved.
+  text twice does not shift it.
+- The box is a **formatted editor**: bold, italic, underline, highlight,
+  bulleted and numbered lists, and indenting with `Tab`. What you see in the
+  box is what gets saved.
+- Only that short list of formatting is kept, because it is what Azure DevOps
+  renders reliably. Highlight is one fixed yellow rather than a colour picker.
+  Anything else you can get into the box -- a colour, a font, a link, a size --
+  is dropped on the way out, and its text kept.
+- **Pasting always arrives as plain text** (unless it is an image or a table).
+  That is deliberate: markup from another application never enters the page,
+  so it can never reach a work item.
+- The formatting you send is checked on the server against a short allowlist
+  of tags, and **every attribute is discarded**; a highlight is redrawn in the
+  board's own colour rather than the page's. So even a page that had been
+  tampered with could not put styling, a script or a link into a work item.
 - The Desktop shortcut runs the ordinary, Microsoft-signed `pythonw.exe`
   that is already on the machine, and wears its own icon (drawn by
   `scripts/make_icon.py`, no image library needed). It is deliberately not

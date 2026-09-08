@@ -255,6 +255,13 @@ work items or statuses.
 
 ## Security design (do not regress these)
 
+- Formatted text from the editor goes through `clean_rich_html`, an allowlist
+  (`RICH_TAGS`). Any other tag is dropped and only its text kept, **every
+  attribute is discarded**, and `img`/`table` are dropped outright because
+  those travel separately as server-issued tokens. Highlight is re-emitted in
+  the server's own colour, never the page's. Pasting into the editor is forced
+  to plain text on the page as well.
+
 - Pasted tables go to `/api/table`, which runs `_TableCleaner` (an allowlist
   HTMLParser: table tags only, `colspan`/`rowspan` only, `<style>`/`<script>`
   bodies skipped, everything outside a `<table>` dropped) and stores the

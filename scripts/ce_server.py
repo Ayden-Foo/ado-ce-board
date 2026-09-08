@@ -301,14 +301,170 @@ def _esc_html(text):
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def build_comment_html(text, mentions):
-    """Turn plain comment text into the HTML Azure DevOps needs, converting
+# The only formatting the editor may send back. Everything else is discarded
+# on arrival, so what reaches a work item is always markup this server wrote.
+RICH_TAGS = ("b", "strong", "i", "em", "u", "div", "p", "ul", "ol", "li",
+             "blockquote", "span", "font")
+RICH_DROP_TREE = ("script", "style", "table", "head", "iframe", "object",
+                  "svg", "math")
+RICH_VOID = ("img", "hr", "input", "meta", "link", "col", "source", "embed")
+HIGHLIGHT = "#fff29a"
+INDENT_STYLE = "margin:0 0 0 40px"
+MAX_RICH_CHARS = 100000
+_BLANK_BG = ("transparent", "none", "initial", "inherit", "unset", "white",
+             "#fff", "#ffffff", "rgb(255,255,255)", "rgba(0,0,0,0)")
+
+
+def _is_highlight(attrs):
+    """Whether a <span> the editor produced is a highlight worth keeping.
+
+    The colour itself is not taken from the page: any highlighted run is
+    redrawn in this module's own colour, so a span cannot carry styling of its
+    choosing into a work item.
+    """
+    for name, value in attrs:
+        if name.lower() != "style" or not value:
+            continue
+        for part in value.split(";"):
+            prop, _, val = part.partition(":")
+            if prop.strip().lower() in ("background", "background-color"):
+                val = re.sub(r"\s+", "", val).strip().lower()
+                if val and val not in _BLANK_BG:
+                    return True
+    return False
+
+
+class _RichText(HTMLParser):
+    """Reduce the editor's HTML to the handful of tags a work item may carry.
+
+    This is the one place the page's own markup is read, so it works by
+    allowlist: a tag that is not named here is dropped and only its text
+    survives, and every attribute is discarded. Images and tables are dropped
+    outright because they travel separately, as tokens the server can vouch
+    for. Nothing that can execute, load or style beyond this list gets through.
+    """
+
+    def __init__(self, mentions=None):
+        HTMLParser.__init__(self, convert_charrefs=True)
+        self.out = []
+        self.stack = []
+        self.skip = 0
+        self.chars = 0
+        # Longest names first so "Foo, Ayden Junior" is not clobbered by
+        # "Foo, Ayden".
+        self.people = []
+        for person in sorted(mentions or [],
+                             key=lambda m: len(m.get("name") or ""),
+                             reverse=True):
+            name, ident = person.get("name"), person.get("id")
+            if name and ident:
+                self.people.append((
+                    "@" + _esc_html(name),
+                    '<a href="#" data-vss-mention="version:2.0,{}">@{}</a>'
+                    .format(_esc_html(ident), _esc_html(name))))
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in RICH_DROP_TREE:
+            self.skip += 1
+            return
+        if self.skip:
+            return
+        if tag == "br":
+            self.out.append("<br>")
+            return
+        if tag in RICH_VOID:
+            return
+        # The name this tag is written out as, or None if it is dropped.
+        out_name = None
+        if tag in RICH_TAGS:
+            if tag in ("span", "font"):
+                # A browser writes a highlight either as a styled span or, with
+                # CSS styling turned off, as a <font>. Both arrive here as the
+                # same plain span, in this module's own colour.
+                if _is_highlight(attrs):
+                    self.out.append('<span style="background-color:{}">'
+                                    .format(HIGHLIGHT))
+                    out_name = "span"
+            elif tag == "blockquote":
+                self.out.append('<blockquote style="{}">'.format(INDENT_STYLE))
+                out_name = "blockquote"
+            else:
+                self.out.append("<{}>".format(tag))
+                out_name = tag
+        # Tags that were not written out are still tracked, so their closing
+        # tag cannot close something else by accident.
+        self.stack.append((tag, out_name))
+
+    def handle_startendtag(self, tag, attrs):
+        if tag.lower() == "br" and not self.skip:
+            self.out.append("<br>")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in RICH_DROP_TREE:
+            self.skip = max(0, self.skip - 1)
+            return
+        if self.skip or tag == "br" or tag in RICH_VOID:
+            return
+        if not any(open_tag == tag for open_tag, _ in self.stack):
+            return
+        while self.stack:
+            open_tag, out_name = self.stack.pop()
+            if out_name:
+                self.out.append("</{}>".format(out_name))
+            if open_tag == tag:
+                break
+
+    def handle_data(self, data):
+        if self.skip or self.chars >= MAX_RICH_CHARS:
+            return
+        text = data[:MAX_RICH_CHARS - self.chars]
+        self.chars += len(text)
+        text = _esc_html(text)
+        for needle, anchor in self.people:
+            text = text.replace(needle, anchor)
+        self.out.append(text)
+
+    def result(self):
+        while self.stack:
+            _, out_name = self.stack.pop()
+            if out_name:
+                self.out.append("</{}>".format(out_name))
+        return "".join(self.out)
+
+
+def clean_rich_html(html, mentions=None):
+    """Sanitise formatted text on its way to a work item."""
+    parser = _RichText(mentions)
+    parser.feed(html or "")
+    out = parser.result()
+    # Nothing but empty markup is nothing: an image-only or table-only comment
+    # is built from those separately.
+    return "" if not _strip_html(out).strip() else out
+
+
+def editable_html(raw):
+    """The same field, reduced to what the editor is able to show and send.
+
+    Seeding the editor with this rather than the raw field means saving it
+    back unchanged cannot alter anything, because it has already been through
+    the filter that a save goes through.
+    """
+    return clean_rich_html(raw)
+
+
+def build_comment_html(text, mentions, html=None):
+    """Turn what was written into the HTML Azure DevOps needs, converting
     picked people into real @mention anchors so they get notified.
 
-    Line breaks, blank lines and bullet or numbered lists are turned back into
-    markup, so text taken apart by to_plain_text and saved again comes out
-    looking the way it went in.
+    Formatted text arrives as HTML and is sanitised. Plain text is still
+    accepted: line breaks, blank lines and bullet or numbered lists are turned
+    back into markup, so text taken apart by to_plain_text and saved again
+    comes out looking the way it went in.
     """
+    if html is not None:
+        return clean_rich_html(html, mentions)
     html = _esc_html(text)
     # Longest names first so "Foo, Ayden Junior" is not clobbered by "Foo, Ayden".
     for person in sorted(mentions or [], key=lambda m: len(m.get("name") or ""),
@@ -386,8 +542,9 @@ def update_item(item_id, changes):
     comment = (changes.get("comment") or "").strip()
     images = _allowed_images(changes.get("images"))
     tables = _allowed_tables(changes.get("tables"))
-    if comment or images or tables:
-        html = build_comment_html(comment, changes.get("mentions"))
+    if comment or images or tables or changes.get("html"):
+        html = build_comment_html(comment, changes.get("mentions"),
+                                  changes.get("html"))
         for table in tables:
             html += ("<br>" if html else "") + table
         for src in images:
@@ -550,6 +707,7 @@ def item_detail(item_id):
         "mine": bool(mine_id) and (c.get("createdBy") or {}).get("id") == mine_id,
         "text": to_plain_text(c.get("text", "")),
         "html": safe_html(c.get("text", "")),
+        "edit": editable_html(c.get("text", "")),
         "kept": _kept_preview(c.get("text", "")),
     } for c in raw]
     comments.sort(key=lambda c: c.get("at") or "")
@@ -607,6 +765,9 @@ def item_detail(item_id):
             "project": owner,
             "description": to_plain_text(f.get("System.Description", "")),
             "repro": to_plain_text(f.get("Microsoft.VSTS.TCM.ReproSteps", "")),
+            "descEdit": editable_html(f.get("System.Description", "")),
+            "reproEdit": editable_html(
+                f.get("Microsoft.VSTS.TCM.ReproSteps", "")),
             "descriptionHtml": safe_html(f.get("System.Description", "")),
             "reproHtml": safe_html(f.get("Microsoft.VSTS.TCM.ReproSteps", "")),
             # Which field the card is actually showing, so the editor writes
@@ -1080,7 +1241,7 @@ def edit_comment(item_id, comment_id, changes):
     added = [src for src in _allowed_images(changes.get("images"))
              if src not in kept]
     body = build_comment_html((changes.get("comment") or "").strip(),
-                              changes.get("mentions"))
+                              changes.get("mentions"), changes.get("html"))
     for table in _tables_for_edit(existing.get("text", ""), changes):
         body += ("<br>" if body else "") + table
     for src in kept + added:
@@ -1113,7 +1274,7 @@ def edit_description(item_id, changes):
     current = (call(base).get("fields") or {}).get(field, "") or ""
     kept = _comment_images(current)
     body = build_comment_html((changes.get("text") or "").strip(),
-                              changes.get("mentions"))
+                              changes.get("mentions"), changes.get("html"))
     for table in _tables_for_edit(current, changes):
         body += ("<br>" if body else "") + table
     added = [src for src in _allowed_images(changes.get("images"))
@@ -1804,7 +1965,20 @@ PAGE = r"""<!doctype html>
  label{display:block;font-size:12px;color:#656d76;margin:8px 0 3px}
  input,select,textarea{width:100%;padding:7px 9px;border:1px solid #d0d7de;border-radius:6px;font:inherit;background:#fff;color:inherit;box-sizing:border-box}
  textarea{min-height:64px;resize:vertical}
-.ctext{min-height:150px;max-height:60vh;line-height:1.5;resize:vertical;overflow-y:auto}
+.ctext{min-height:150px;max-height:60vh;line-height:1.5;resize:vertical;overflow-y:auto;
+   width:100%;padding:7px 9px;border:1px solid #d0d7de;border-radius:0 0 6px 6px;
+   background:#fff;color:inherit;box-sizing:border-box;text-align:left}
+ .ctext:focus{outline:none;border-color:#0969da}
+ .ctext ul,.ctext ol{margin:4px 0;padding-left:26px}
+ .ctext blockquote{margin:0 0 0 40px;border:0;padding:0}
+ .ctext:empty:before{content:attr(data-ph);color:#8c959f}
+ .rtb{display:flex;gap:2px;flex-wrap:wrap;align-items:center;padding:4px 6px;
+   border:1px solid #d0d7de;border-bottom:0;border-radius:6px 6px 0 0;background:#f6f8fa}
+ .rtb button{width:auto;min-width:28px;height:26px;padding:0 7px;font-size:13px;line-height:1;
+   background:transparent;border:1px solid transparent;border-radius:5px;color:#1f2328;cursor:pointer}
+ .rtb button:hover{background:#eaeef2;border-color:#d0d7de}
+ .rtb .sep{width:1px;height:18px;background:#d0d7de;margin:0 4px}
+ .rtb .hl{background:#fff29a;border-color:#e6d98a}
 .chint{float:right;font-size:11px;color:#8c959f;font-weight:400}
 .pastes{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 0}
 .paste{position:relative;display:inline-flex;align-items:center;border:1px solid #d0d7de;
@@ -2000,12 +2174,7 @@ function render() {
           paste a screenshot to attach it
           <span class="chint">drag the corner to resize &middot;
             <a href="#" onclick="event.preventDefault();resetCH()">reset</a></span></label>
-        <div class="cwrap"><textarea id="c${w.id}" class="ctext" autocomplete="off"
-             oninput="onComment('${w.id}'); grow(this)"
-             onmousedown="markH(this)" onmouseup="saveH(this)"
-             onpaste="onPaste(event, '${w.id}', ${w.id})"
-             onkeydown="mentionKey(event, '${w.id}')"></textarea>
-          <div class="mbox" id="mb${w.id}"></div></div>
+        ${editorBox(w.id, w.id, "Write a comment...")}
         <div class="pastes" id="pv${w.id}"></div>
         <div class="acts">
           <button onclick="save(${w.id})" id="b${w.id}">Save</button>
@@ -2104,7 +2273,7 @@ function editComment(id, cid) {
   const d = detailCache[id];
   if (!row || !d) return;
   const c = (d.comments || []).find(x => x.id === cid);
-  if (!c || row.querySelector("textarea")) return;
+  if (!c || row.querySelector(".ctext")) return;
   // The editor reuses the new-comment element naming ("c"/"mb"/"pv"/"m"/"b"
   // plus a key) so the @mention and paste helpers work here unchanged.
   const k = id + "-" + cid;
@@ -2112,12 +2281,7 @@ function editComment(id, cid) {
   row.innerHTML =
     `<span class="meta">${esc(c.author)} &middot; editing &mdash; type @ to tag
        someone, paste a screenshot or a table</span>
-     <div class="cwrap"><textarea class="ctext" id="c${k}" autocomplete="off"
-        oninput="onComment('${k}'); grow(this)"
-        onmousedown="markH(this)" onmouseup="saveH(this)"
-        onpaste="onPaste(event, '${k}', ${id})"
-        onkeydown="mentionKey(event, '${k}')"></textarea>
-       <div class="mbox" id="mb${k}"></div></div>
+     ${editorBox(k, id, "")}
      <div class="pastes" id="pv${k}"></div>
      ${keptStrip(c.kept, k)}
      <div class="acts">
@@ -2130,7 +2294,7 @@ function editComment(id, cid) {
   tabled[k] = [];
   paintKept(k);
   const ta = document.getElementById("c" + k);
-  ta.value = c.text || "";
+  ta.innerHTML = c.edit || "";
   ta.focus();
 }
 
@@ -2185,19 +2349,14 @@ function descKey(id) { return "desc-" + id; }
 function editDesc(id) {
   const box = document.getElementById("ds" + id);
   const d = detailCache[id];
-  if (!box || !d || box.querySelector("textarea")) return;
+  if (!box || !d || box.querySelector(".ctext")) return;
   const it = d.item;
   const repro = it.descField !== "System.Description";
   const k = descKey(id);
   box.dataset.html = box.innerHTML;
   box.innerHTML =
-    `<div class="cwrap"><textarea class="ctext" id="c${k}" autocomplete="off"
-        oninput="onComment('${k}'); grow(this)"
-        onmousedown="markH(this)" onmouseup="saveH(this)"
-        onpaste="onPaste(event, '${k}', ${id})"
-        onkeydown="mentionKey(event, '${k}')"></textarea>
-       <div class="mbox" id="mb${k}"></div></div>
-     <div class="pastes" id="pv${k}"></div>
+    editorBox(k, id, "") +
+    `<div class="pastes" id="pv${k}"></div>
      ${keptStrip(repro ? it.reproKept : it.descKept, k)}
      <div class="acts">
        <button onclick="saveDesc(${id})" id="b${k}">Save description</button>
@@ -2209,8 +2368,7 @@ function editDesc(id) {
   tabled[k] = [];
   paintKept(k);
   const ta = document.getElementById("c" + k);
-  ta.value = (repro ? it.repro : it.description) || "";
-  grow(ta);
+  ta.innerHTML = (repro ? it.reproEdit : it.descEdit) || "";
   ta.focus();
 }
 
@@ -2227,11 +2385,10 @@ function cancelDesc(id) {
 
 async function saveDesc(id) {
   const k = descKey(id);
-  const ta = document.getElementById("c" + k);
   const msg = document.getElementById("m" + k);
   const btn = document.getElementById("b" + k);
   const it = (detailCache[id] || {}).item || {};
-  const text = (ta.value || "").trim();
+  const text = edText(k).trim(), html = edHtml(k);
   const imgs = (pasted[k] || []).filter(s => !s.pending && s.url).map(s => s.url);
   const tbls = (tabled[k] || []).map(t => t.token);
   const keeps = (keptImgs[k] || []).length + (kepts[k] || []).length;
@@ -2241,8 +2398,9 @@ async function saveDesc(id) {
   const mentions = (picked[k] || []).filter(p => text.includes("@" + p.name));
   try {
     await api("/api/description", {method: "POST", body: JSON.stringify(
-      {id: id, field: it.descField, text: text, mentions: mentions,
-       images: imgs, tables: tbls, project: it.project || PROJECT,
+      {id: id, field: it.descField, text: text, html: html,
+       mentions: mentions, images: imgs, tables: tbls,
+       project: it.project || PROJECT,
        keptTables: (kepts[k] || []).map(t => t.token)})});
     delete picked[k];
     delete pasted[k];
@@ -2267,10 +2425,9 @@ function cancelComment(id, cid) {
 
 async function saveComment(id, cid) {
   const k = id + "-" + cid;
-  const ta = document.getElementById("c" + k);
   const msg = document.getElementById("m" + k);
   const btn = document.getElementById("b" + k);
-  const text = (ta.value || "").trim();
+  const text = edText(k).trim(), html = edHtml(k);
   const imgs = (pasted[k] || []).filter(s => !s.pending && s.url).map(s => s.url);
   const tbls = (tabled[k] || []).map(t => t.token);
   if (!text && !imgs.length && !tbls.length) { msg.className = "msg err"; msg.textContent = "Comment cannot be empty."; return; }
@@ -2279,8 +2436,8 @@ async function saveComment(id, cid) {
   const project = ((detailCache[id] || {}).item || {}).project || PROJECT;
   try {
     await api("/api/comment", {method: "POST", body: JSON.stringify(
-      {id: id, commentId: cid, comment: text, mentions: mentions,
-       images: imgs, tables: tbls, project: project,
+      {id: id, commentId: cid, comment: text, html: html,
+       mentions: mentions, images: imgs, tables: tbls, project: project,
        keptTables: (kepts[k] || []).map(t => t.token)})});
     delete picked[k];
     delete pasted[k];
@@ -2570,7 +2727,11 @@ async function onPaste(ev, key, itemId) {
       ev.preventDefault();
       return pasteTable(key, "", plain);
     }
-    return;   // ordinary text paste: leave it to the browser
+    // Ordinary text paste. Only the text of it is taken, so formatting
+    // and markup from another application cannot ride in with it.
+    ev.preventDefault();
+    document.execCommand("insertText", false, plain || "");
+    return;
   }
   ev.preventDefault();
   const msg = document.getElementById("m" + key);
@@ -2605,7 +2766,7 @@ async function save(id) {
   const fields = {}, title = document.getElementById("t" + id).value.trim(),
         state = document.getElementById("s" + id).value,
         who = document.getElementById("a" + id).value.trim(),
-        comment = document.getElementById("c" + id).value;
+        comment = edText(id), commentHtml = edHtml(id);
   const imgs = (pasted[id] || []).filter(s => !s.pending && s.url).map(s => s.url);
   const tbls = (tabled[id] || []).map(t => t.token);
   if (title && title !== w.title) fields["System.Title"] = title;
@@ -2616,12 +2777,13 @@ async function save(id) {
   // Only send people actually still referenced in the text.
   const mentions = (picked[id] || []).filter(p => comment.includes("@" + p.name));
   try {
-    await api("/api/item/" + id, {method: "POST", body: JSON.stringify({fields, comment, mentions, images: imgs, tables: tbls})});
+    await api("/api/item/" + id, {method: "POST", body: JSON.stringify(
+      {fields, comment, html: commentHtml, mentions, images: imgs, tables: tbls})});
     msg.className = "msg ok";
     msg.textContent = "Saved." + (mentions.length ? ` Tagged ${mentions.length} person(s).` : "")
                     + (imgs.length ? ` ${imgs.length} image(s) added.` : "")
                     + (tbls.length ? ` ${tbls.length} table(s) added.` : "");
-    document.getElementById("c" + id).value = "";
+    edSet(id, "");
     picked[id] = [];
     pasted[id] = [];
     tabled[id] = [];
@@ -2632,19 +2794,105 @@ async function save(id) {
   btn.disabled = false;
 }
 
+// ---- the formatted text box ------------------------------------------------
+// One definition, used by the new-comment box, the comment editor and the
+// description editor, so all three behave identically.
+const HL = "#fff29a";
+
+function editorBox(key, itemId, placeholder) {
+  const b = (cmd, label, title, style) =>
+    `<button type="button" title="${title}" style="${style || ''}"
+       onmousedown="event.preventDefault()"
+       onclick="rte('${key}','${cmd}')">${label}</button>`;
+  return `<div class="rtb">
+      ${b("bold", "<b>B</b>", "Bold (Ctrl+B)")}
+      ${b("italic", "<i>I</i>", "Italic (Ctrl+I)")}
+      ${b("underline", "<u>U</u>", "Underline (Ctrl+U)")}
+      ${b("hilite", "<span class=hl>&nbsp;A&nbsp;</span>", "Highlight, or remove it")}
+      <span class="sep"></span>
+      ${b("insertUnorderedList", "&bull;&nbsp;list", "Bulleted list")}
+      ${b("insertOrderedList", "1.&nbsp;list", "Numbered list")}
+      ${b("indent", "&rarr;", "Indent (Tab)")}
+      ${b("outdent", "&larr;", "Outdent (Shift+Tab)")}
+      <span class="sep"></span>
+      ${b("removeFormat", "clear", "Remove formatting from the selection")}
+    </div>
+    <div class="cwrap"><div class="ctext" id="c${key}" contenteditable="true"
+       data-ph="${placeholder || ''}" spellcheck="true"
+       oninput="onComment('${key}')"
+       onmousedown="markH(this)" onmouseup="saveH(this)"
+       onpaste="onPaste(event, '${key}', ${itemId})"
+       onkeydown="editorKey(event, '${key}')"></div>
+      <div class="mbox" id="mb${key}"></div></div>`;
+}
+
+// Formatting is applied by the browser's own editing commands, so the markup
+// is the browser's rather than something this page assembles by hand. The
+// server allows through only the few tags these produce.
+function rte(key, cmd) {
+  const box = document.getElementById("c" + key);
+  if (!box) return;
+  box.focus();
+  if (cmd === "hilite") {
+    try { document.execCommand("styleWithCSS", false, true); } catch (e) { /* older browser */ }
+    const now = (document.queryCommandValue("backColor") || "").replace(/\s/g, "").toLowerCase();
+    const on = now === "rgb(255,242,154)" || now === "#fff29a";
+    const colour = on ? "transparent" : HL;
+    if (!document.execCommand("hiliteColor", false, colour)) {
+      document.execCommand("backColor", false, colour);
+    }
+    return;
+  }
+  // Everything else is asked for as tags (<b>, <i>, <u>) rather than styles.
+  try { document.execCommand("styleWithCSS", false, false); } catch (e) { /* older browser */ }
+  document.execCommand(cmd, false, null);
+}
+
+function edText(key) {
+  const b = document.getElementById("c" + key);
+  return b ? (b.innerText || "") : "";
+}
+
+function edHtml(key) {
+  const b = document.getElementById("c" + key);
+  return b ? b.innerHTML : "";
+}
+
+function edSet(key, html) {
+  const b = document.getElementById("c" + key);
+  if (b) b.innerHTML = html || "";
+}
+
+function editorKey(event, id) {
+  if (mState && String(mState.id) === String(id)) {
+    mentionKey(event, id);
+    if (event.defaultPrevented) return;
+  }
+  if (event.key === "Tab") {
+    event.preventDefault();
+    document.execCommand(event.shiftKey ? "outdent" : "indent", false, null);
+  }
+}
+
 // ---- @mention autocomplete -------------------------------------------------
 const picked = {};       // work item id -> people already inserted
 let mState = null;       // {id, start, people, active}
 
 function mentionQuery(box) {
-  // Look back from the caret for an "@..." run that has no whitespace break.
-  const upto = box.value.slice(0, box.selectionStart);
+  // Look back from the caret for an "@..." run that has no line break. The
+  // caret is a position in a text node now, so the search stays in that node.
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount) return null;
+  const r = sel.getRangeAt(0);
+  if (!r.collapsed || r.startContainer.nodeType !== 3) return null;
+  if (!box || !box.contains(r.startContainer)) return null;
+  const node = r.startContainer, upto = node.data.slice(0, r.startOffset);
   const at = upto.lastIndexOf("@");
   if (at < 0) return null;
   const frag = upto.slice(at + 1);
   if (/[\n\r]/.test(frag) || frag.length > 40) return null;
   if (at > 0 && !/[\s(<]/.test(upto[at - 1])) return null;
-  return {start: at, text: frag};
+  return {node: node, start: at, end: r.startOffset, text: frag};
 }
 
 const CH_KEY = "ceCommentHeight";
@@ -2669,6 +2917,7 @@ function saveH(el) {
 }
 
 function grow(el) {
+  if (el && el.isContentEditable) return;   // it already fits its content
   let saved = null;
   try { saved = localStorage.getItem(CH_KEY); } catch (e) { /* ignore */ }
   if (saved) return;  // the user picked a size; leave it alone
@@ -2694,8 +2943,9 @@ async function onComment(id) {
     if (!d.people.length) return hideMentions(id);
     // The caret may have moved on while the lookup was in flight.
     const still = mentionQuery(box);
-    if (!still || still.start !== q.start) return;
-    mState = {id, start: q.start, people: d.people, active: 0};
+    if (!still || still.start !== q.start || still.node !== q.node) return;
+    mState = {id, node: q.node, start: q.start, end: still.end,
+              people: d.people, active: 0};
     drawMentions();
   } catch (e) { hideMentions(id); }
 }
@@ -2717,13 +2967,20 @@ function hideMentions(id) {
 
 function pickMention(index) {
   if (!mState) return;
-  const {id, start} = mState, person = mState.people[index];
+  const id = mState.id, person = mState.people[index];
   const box = document.getElementById("c" + id);
-  const after = box.value.slice(box.selectionStart);
+  // Re-read the caret: more may have been typed since the list appeared.
+  const q = mentionQuery(box) || mState;
+  const node = q.node;
+  if (!box || !node || !box.contains(node)) return hideMentions(id);
   const insert = "@" + person.name + " ";
-  box.value = box.value.slice(0, start) + insert + after;
-  const caret = start + insert.length;
-  box.focus(); box.setSelectionRange(caret, caret);
+  node.replaceData(q.start, Math.max(0, q.end - q.start), insert);
+  const sel = window.getSelection(), r = document.createRange();
+  r.setStart(node, q.start + insert.length);
+  r.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(r);
+  box.focus();
   picked[id] = (picked[id] || []).filter(p => p.id !== person.id).concat(person);
   hideMentions(id);
 }
