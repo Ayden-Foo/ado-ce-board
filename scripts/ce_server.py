@@ -263,23 +263,26 @@ def type_states(work_item_type):
     return names
 
 
-# Severity is a custom field, so it is named differently from one work item
-# type to the next. These are the ones this tool knows how to write, tried in
-# order; a type that has none of them simply gets no severity control.
-SEVERITY_FIELDS = ("Custom.EscalationSeverity", "Microsoft.VSTS.Common.Severity")
+# How urgent a case is goes by a different field name on every work item
+# type: a Customer Escalation has Escalation Severity and Escalation Priority,
+# a Bug has the standard Severity. These are the ones this tool knows how to
+# write, in preference order; a type with none of them gets no control.
+SEVERITY_FIELDS = ("Custom.EscalationSeverity", "Custom.EscalationPriority",
+                   "Microsoft.VSTS.Common.Severity")
 _severity_cache = {}
 
 
 def severity_choices(project, work_item_type):
-    """The severity field a work item type uses, and the values it allows.
+    """Every severity-like list a work item type defines, in that order.
 
-    Both come from Azure DevOps rather than from anything typed here, so the
-    board can never offer -- or save -- a value the project would reject.
+    The fields, their labels and their values all come from Azure DevOps
+    rather than from anything written here, so the board can never offer --
+    or save -- a value the project would reject.
     """
     key = (project or PROJECT, work_item_type or "")
     if key in _severity_cache:
         return _severity_cache[key]
-    found = ("", [])
+    found = []
     if work_item_type:
         try:
             data = call("{}/_apis/wit/workitemtypes/{}/fields"
@@ -292,10 +295,28 @@ def severity_choices(project, work_item_type):
         for ref in SEVERITY_FIELDS:
             field = by_ref.get(ref)
             if field and not field.get("readOnly") and field.get("allowedValues"):
-                found = (ref, [v for v in field["allowedValues"] if v])
-                break
+                found.append((ref, field.get("name") or "Severity",
+                              [v for v in field["allowedValues"] if v]))
     _severity_cache[key] = found
     return found
+
+
+def severity_for_item(fields, project, work_item_type):
+    """The one to show for a work item: whichever it actually carries.
+
+    A type can define more than one of these and use only one of them -- a
+    Customer Escalation defines Escalation Severity but is filled in with
+    Escalation Priority -- so the field the item has a value in wins, and the
+    first one is only a fallback for an item with none of them set.
+    """
+    options = severity_choices(project, work_item_type)
+    if not options:
+        return ("", "", [], "")
+    for ref, label, values in options:
+        if fields.get(ref):
+            return (ref, label, values, fields[ref])
+    ref, label, values = options[0]
+    return (ref, label, values, "")
 
 
 def _batch_items(ids):
@@ -595,11 +616,11 @@ def _check_severity(item_id, field, value):
     except ApiError:
         raise ApiError(400, "Could not check the severity for this item.")
     fields = item.get("fields") or {}
-    ref, values = severity_choices(fields.get("System.TeamProject"),
-                                   fields.get("System.WorkItemType"))
-    if field != ref:
+    allowed = {ref: values for ref, _, values in severity_choices(
+        fields.get("System.TeamProject"), fields.get("System.WorkItemType"))}
+    if field not in allowed:
         raise ApiError(400, "This work item type has no severity to set.")
-    if value and value not in values:
+    if value and value not in allowed[field]:
         raise ApiError(400, "Not a severity this work item allows.")
 
 
@@ -827,8 +848,8 @@ def item_detail(item_id):
                 "comment": attrs.get("comment") or "", "external": False,
             })
     _annotate_links(links)
-    sev_field, sev_values = severity_choices(
-        owner, f.get("System.WorkItemType", ""))
+    sev_field, sev_label, sev_values, sev_value = severity_for_item(
+        f, owner, f.get("System.WorkItemType", ""))
     return {
         "item": {
             "id": item.get("id"),
@@ -844,7 +865,8 @@ def item_detail(item_id):
             "areaPath": f.get("System.AreaPath", ""),
             "project": owner,
             "severityField": sev_field,
-            "severity": f.get(sev_field, "") if sev_field else "",
+            "severityLabel": sev_label or "Severity",
+            "severity": sev_value,
             "severityValues": sev_values,
             "description": to_plain_text(f.get("System.Description", "")),
             "repro": to_plain_text(f.get("Microsoft.VSTS.TCM.ReproSteps", "")),
@@ -2561,7 +2583,7 @@ function drawSeverity(id) {
   const opts = [""].concat(it.severityValues).map(v =>
     `<option value="${esc(v)}"${v === (it.severity || "") ? " selected" : ""}>${
        esc(v) || "(none)"}</option>`).join("");
-  cell.innerHTML = `<label>Severity</label>
+  cell.innerHTML = `<label>${esc(it.severityLabel || "Severity")}</label>
     <select id="v${id}">${opts}</select>`;
 }
 

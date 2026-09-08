@@ -43,7 +43,7 @@ Open the **CE Board** shortcut.
 | See your open items | Default view |
 | Open one | Click the row |
 | Change State / Assignee / Title | Expand the row, edit, **Save** |
-| Change the severity | Expand the row, pick from the **Severity** list, **Save** |
+| Change the severity | Expand the row, pick from the severity list, **Save** |
 | See the severity at a glance | A coloured badge next to the state, when the item has one |
 | Comment | Expand the row, type in the comment box, **Save** |
 | Add a screenshot to a comment | Paste it straight into the comment box; a thumbnail appears, **Save** posts it |
@@ -147,12 +147,15 @@ sees your password.
 - The severity is shown on the row itself, beside the state, so you can scan
   the list without opening anything. Items whose type has no severity, or that
   have not been given one, simply show nothing.
-- **Severity** appears only when the work item type actually has one, and the
-  choices come from Azure DevOps, not from this tool. On a Customer Escalation
-  that is *Escalation Severity*; on a Bug it is the standard *Severity*. Before
-  saving, the server re-checks against the item's own type that the field
-  exists and the value is one it allows, so a value the project would reject
-  never gets sent. Leave it blank to clear it.
+- The severity control appears only when the work item type actually has one,
+  and both its label and its choices come from Azure DevOps rather than from
+  this tool. A type can define more than one such field and use only one of
+  them -- a Customer Escalation defines *Escalation Severity* but is filled in
+  with *Escalation Priority* -- so the board shows whichever field the item
+  actually carries a value in, under that field's own name. Before saving, the
+  server re-checks against the item's own type that the field exists and the
+  value is one it allows, so a value the project would reject never gets sent.
+  Leave it blank to clear it.
 - Pasted screenshots are uploaded to the work item as normal Azure DevOps
   attachments and embedded in the comment. Nothing is written to local disk.
   A comment can only embed an image this tool itself uploaded in the same
