@@ -231,11 +231,7 @@ def list_items(open_only=True, match="both", top=200):
     ids = [int(x["id"]) for x in result.get("workItems", [])][:top]
     if not ids:
         return []
-    items = []
-    for start in range(0, len(ids), 200):
-        batch = call("_apis/wit/workitemsbatch?api-version=" + API,
-                     {"ids": ids[start:start + 200], "fields": FIELDS})
-        items.extend(batch.get("value", []))
+    items = _batch_items(ids)
     order = {wid: pos for pos, wid in enumerate(ids)}
     items.sort(key=lambda it: order.get(it.get("id"), 0))
     return [{
@@ -250,6 +246,7 @@ def list_items(open_only=True, match="both", top=200):
         "changedById": identity_id(it["fields"].get("System.ChangedBy")),
         "assignedToId": identity_id(it["fields"].get("System.AssignedTo")),
         "tags": it["fields"].get("System.Tags", ""),
+        "severity": _severity_of(it["fields"]),
         "project": it["fields"].get("System.TeamProject", ""),
         "url": "https://dev.azure.com/{}/{}/_workitems/edit/{}".format(
             ORG, PROJECT, it.get("id")),
@@ -299,6 +296,33 @@ def severity_choices(project, work_item_type):
                 break
     _severity_cache[key] = found
     return found
+
+
+def _batch_items(ids):
+    """Fetch the fields the board lists, with severity when it is available."""
+    items = []
+    wanted = list(FIELDS) + list(SEVERITY_FIELDS)
+    for start in range(0, len(ids), 200):
+        chunk = ids[start:start + 200]
+        try:
+            batch = call("_apis/wit/workitemsbatch?api-version=" + API,
+                         {"ids": chunk, "fields": wanted})
+        except ApiError:
+            # A project that does not define one of these severity fields
+            # rejects the whole request, so fall back to the plain list. The
+            # rows then simply show no severity rather than failing to load.
+            batch = call("_apis/wit/workitemsbatch?api-version=" + API,
+                         {"ids": chunk, "fields": FIELDS})
+        items.extend(batch.get("value", []))
+    return items
+
+
+def _severity_of(fields):
+    """Whichever severity field this work item type happens to use."""
+    for ref in SEVERITY_FIELDS:
+        if fields.get(ref):
+            return fields[ref]
+    return ""
 
 
 def search_identities(query, limit=8):
@@ -1437,11 +1461,7 @@ def search_items(query="", include_closed=True, top=100, scope="created"):
 def _hydrate(ids):
     if not ids:
         return []
-    items = []
-    for start in range(0, len(ids), 200):
-        batch = call("_apis/wit/workitemsbatch?api-version=" + API,
-                     {"ids": ids[start:start + 200], "fields": FIELDS})
-        items.extend(batch.get("value", []))
+    items = _batch_items(ids)
     order = {wid: pos for pos, wid in enumerate(ids)}
     items.sort(key=lambda it: order.get(it.get("id"), 0))
     return [{
@@ -1456,6 +1476,7 @@ def _hydrate(ids):
         "changedById": identity_id(it["fields"].get("System.ChangedBy")),
         "assignedToId": identity_id(it["fields"].get("System.AssignedTo")),
         "tags": it["fields"].get("System.Tags", ""),
+        "severity": _severity_of(it["fields"]),
         "project": it["fields"].get("System.TeamProject", ""),
         "url": "https://dev.azure.com/{}/{}/_workitems/edit/{}".format(
             ORG, urllib.parse.quote(
@@ -2126,6 +2147,12 @@ PAGE = r"""<!doctype html>
  .fdl{color:#0969da;text-decoration:none;font-size:12px;white-space:nowrap}
  .fdl:hover{text-decoration:underline}
  .ltype{font-size:11px;color:#656d76;background:#f6f8fa;border:1px solid #d0d7de;border-radius:10px;padding:1px 7px;white-space:nowrap}
+ .sev{font-size:11px;border-radius:10px;padding:1px 8px;white-space:nowrap;
+   flex-shrink:0;border:1px solid #d0d7de;background:#f6f8fa;color:#57606a}
+ .sev.critical{background:#ffebe9;border-color:#ff8182;color:#a40e26}
+ .sev.high{background:#fff1e5;border-color:#ffb77c;color:#953800}
+ .sev.medium{background:#fff8c5;border-color:#d4a72c;color:#7d4e00}
+ .sev.low{background:#ddf4ff;border-color:#54aeff;color:#0550ae}
  .proj{font-size:11px;color:#8250df;background:#fbefff;border:1px solid #e2c5ff;border-radius:10px;padding:1px 7px;white-space:nowrap;flex-shrink:0}
  button.link{background:none;border:0;color:#656d76;cursor:pointer;font-size:11px;padding:2px 4px}
  button.link.danger:hover{color:#cf222e;text-decoration:underline}
@@ -2207,6 +2234,16 @@ const esc = s => (s || "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":
 let items = [];
 let scopeUsed = "created";
 
+// Severity reads like "1 - High", and the wording differs between work item
+// types, so the colour comes from the word rather than the number.
+function sevClass(value) {
+  const word = String(value || "").toLowerCase();
+  for (const name of ["critical", "high", "medium", "low"]) {
+    if (word.includes(name)) return name;
+  }
+  return "";
+}
+
 function render() {
   const el = document.getElementById("list");
   if (!items.length) { el.className = "empty"; el.textContent = "No work items found."; return; }
@@ -2216,6 +2253,8 @@ function render() {
       <div class="row" onclick="toggle(${w.id})">
         <span class="id">${w.id}</span>
         <span class="pill ${esc(w.state)}">${esc(w.state)}</span>
+        ${w.severity ? `<span class="sev ${sevClass(w.severity)}"
+           title="Severity">${esc(w.severity)}</span>` : ""}
         ${w.project && w.project !== PROJECT ? `<span class="proj">${esc(w.project)}</span>` : ""}
         <span class="title">${esc(w.title)}</span>
         <span class="who">${esc(w.assignedTo) || "unassigned"}${

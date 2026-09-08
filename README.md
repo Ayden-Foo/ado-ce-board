@@ -44,6 +44,7 @@ Open the **CE Board** shortcut.
 | Open one | Click the row |
 | Change State / Assignee / Title | Expand the row, edit, **Save** |
 | Change the severity | Expand the row, pick from the **Severity** list, **Save** |
+| See the severity at a glance | A coloured badge next to the state, when the item has one |
 | Comment | Expand the row, type in the comment box, **Save** |
 | Add a screenshot to a comment | Paste it straight into the comment box; a thumbnail appears, **Save** posts it |
 | Fix a comment you already posted | Click **edit** on your own comment in Discussion, change it, **Save comment** |
@@ -143,6 +144,9 @@ sees your password.
 - Only Title, State, Assigned To, Tags, Severity, Description and Repro
   Steps can be written by the board. Any other field name is rejected by the
   server. Azure DevOps records the edit, so the change is auditable.
+- The severity is shown on the row itself, beside the state, so you can scan
+  the list without opening anything. Items whose type has no severity, or that
+  have not been given one, simply show nothing.
 - **Severity** appears only when the work item type actually has one, and the
   choices come from Azure DevOps, not from this tool. On a Customer Escalation
   that is *Escalation Severity*; on a Bug it is the standard *Severity*. Before
