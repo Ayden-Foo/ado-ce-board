@@ -46,6 +46,8 @@ Open the **CE Board** shortcut.
 | Comment | Expand the row, type in the comment box, **Save** |
 | Add a screenshot to a comment | Paste it straight into the comment box; a thumbnail appears, **Save** posts it |
 | Fix a comment you already posted | Click **edit** on your own comment in Discussion, change it, **Save comment** |
+| Delete a comment you posted | Click **delete** on your own comment; it asks first |
+| Fix the case description | Click **edit** next to Description, change it, **Save description** |
 | Add a table | Copy cells in Excel or a table in Outlook and paste into the comment box |
 | Resize the comment box | Drag its bottom-right corner; the size is remembered |
 | Tag a colleague | Type `@` plus 2+ letters and pick from the list |
@@ -110,8 +112,17 @@ sees your password.
   attribute except `colspan`/`rowspan` is discarded, and anything outside the
   table is dropped. Excel's `<style>`/`<script>` blocks never reach the work
   item. A comment can only embed a table the server itself built.
-- You can only edit your **own** comments; Azure DevOps enforces this and the
-  tool checks it too. Editing keeps any images and tables already in that comment.
+- You can only edit or delete your **own** comments; Azure DevOps enforces this
+  and the tool checks it too, before it changes anything. Editing keeps any
+  images and tables already in that comment.
+- Deleting a comment cannot be undone from the board, so it asks first. The
+  comment is removed from the Azure DevOps discussion.
+- The description editor works like the comment editor: @mentions, pasted
+  screenshots, pasted tables, and the images already there are shown and kept.
+  On a Bug that uses Repro Steps instead of Description, it edits that field,
+  so saving cannot blank the wrong one.
+- Only Title, State, Assigned To, Tags, Description and Repro Steps can be
+  written by the board. Any other field name is rejected by the server.
   Azure DevOps records the edit, so the change is auditable.
 - Pasted screenshots are uploaded to the work item as normal Azure DevOps
   attachments and embedded in the comment. Nothing is written to local disk.

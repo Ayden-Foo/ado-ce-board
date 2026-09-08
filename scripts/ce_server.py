@@ -571,6 +571,16 @@ def item_detail(item_id):
             "repro": _strip_html(f.get("Microsoft.VSTS.TCM.ReproSteps", "")),
             "descriptionHtml": safe_html(f.get("System.Description", "")),
             "reproHtml": safe_html(f.get("Microsoft.VSTS.TCM.ReproSteps", "")),
+            # Which field the card is actually showing, so the editor writes
+            # back to that one rather than blanking the other.
+            "descField": ("System.Description"
+                          if _strip_html(f.get("System.Description", "")).strip()
+                          or not _strip_html(
+                              f.get("Microsoft.VSTS.TCM.ReproSteps", "")).strip()
+                          else "Microsoft.VSTS.TCM.ReproSteps"),
+            "descKept": _kept_preview(f.get("System.Description", "")),
+            "reproKept": _kept_preview(
+                f.get("Microsoft.VSTS.TCM.ReproSteps", "")),
             "url": "https://dev.azure.com/{}/{}/_workitems/edit/{}".format(
                 ORG, urllib.parse.quote(owner), item.get("id")),
         },
@@ -774,18 +784,35 @@ def _kept_preview(text):
     return {"images": images, "tables": [table] if table else []}
 
 
-def edit_comment(item_id, comment_id, changes):
-    """Rewrite one of the signed-in user's own Discussion comments."""
-    project = changes.get("project") or PROJECT
+def _own_comment_path(item_id, comment_id, project):
+    """Locate a comment and refuse it unless the signed-in user wrote it.
+
+    Azure DevOps enforces this too; checking here turns a raw 401 into a clear
+    message and keeps the rule in one place for both edit and delete.
+    """
     path = ("{}/_apis/wit/workItems/{}/comments/{}?api-version=7.1-preview.4"
-            .format(urllib.parse.quote(project), int(item_id), int(comment_id)))
+            .format(urllib.parse.quote(project or PROJECT), int(item_id),
+                    int(comment_id)))
     existing = call(path)
     mine_id = my_identity_id()
     author = (existing.get("createdBy") or {}).get("id") or ""
-    # Azure DevOps rejects this server-side too; failing here gives a clear
-    # message instead of a raw 401 from the API.
     if mine_id and author and author != mine_id:
-        raise ApiError(403, "Azure DevOps only lets you edit your own comments.")
+        raise ApiError(403, "Azure DevOps only lets you change your own "
+                            "comments.")
+    return path, existing
+
+
+def delete_comment(item_id, comment_id, project=None):
+    """Delete one of the signed-in user's own Discussion comments."""
+    path, _ = _own_comment_path(item_id, comment_id, project)
+    call(path, method="DELETE")
+    return {"ok": True, "deleted": int(comment_id)}
+
+
+def edit_comment(item_id, comment_id, changes):
+    """Rewrite one of the signed-in user's own Discussion comments."""
+    path, existing = _own_comment_path(item_id, comment_id,
+                                       changes.get("project"))
     kept = _comment_images(existing.get("text", ""))
     kept_tables = _comment_tables(existing.get("text", ""))
     added = [src for src in _allowed_images(changes.get("images"))
@@ -804,6 +831,41 @@ def edit_comment(item_id, comment_id, changes):
                             "DevOps if that is what you meant.")
     call(path, {"text": body}, method="PATCH")
     return {"ok": True, "images": len(kept) + len(added)}
+
+
+DESC_FIELDS = ("System.Description", "Microsoft.VSTS.TCM.ReproSteps")
+
+
+def edit_description(item_id, changes):
+    """Rewrite a work item's Description (or Repro Steps).
+
+    Like a comment edit, the images and tables already in the field are read
+    back from Azure DevOps and re-attached, so replacing the wording cannot
+    silently discard the screenshots that explain it.
+    """
+    field = changes.get("field") or "System.Description"
+    if field not in DESC_FIELDS:
+        raise ApiError(400, "Field not editable here: {}".format(field))
+    project = changes.get("project") or PROJECT
+    base = "{}/_apis/wit/workitems/{}?api-version={}".format(
+        urllib.parse.quote(project), int(item_id), API)
+    current = (call(base).get("fields") or {}).get(field, "") or ""
+    kept = _comment_images(current)
+    kept_tables = _comment_tables(current)
+    body = build_comment_html((changes.get("text") or "").strip(),
+                              changes.get("mentions"))
+    for table in ([kept_tables] if kept_tables else []) + _allowed_tables(
+            changes.get("tables")):
+        body += ("<br>" if body else "") + table
+    added = [src for src in _allowed_images(changes.get("images"))
+             if src not in kept]
+    for src in kept + added:
+        if body:
+            body += "<br>"
+        body += '<img src="{}" style="max-width:100%">'.format(_esc_html(src))
+    call(base, [{"op": "add", "path": "/fields/" + field, "value": body}],
+         method="PATCH", patch=True)
+    return {"ok": True, "field": field, "images": len(kept) + len(added)}
 
 
 def _annotate_links(links):
@@ -1447,6 +1509,8 @@ PAGE = r"""<!doctype html>
  .proj{font-size:11px;color:#8250df;background:#fbefff;border:1px solid #e2c5ff;border-radius:10px;padding:1px 7px;white-space:nowrap;flex-shrink:0}
  button.link{background:none;border:0;color:#656d76;cursor:pointer;font-size:11px;padding:2px 4px}
  button.link.danger:hover{color:#cf222e;text-decoration:underline}
+.meta a.danger{color:#8b949e}
+.meta a.danger:hover{color:#cf222e}
  .drop{border:1px dashed #8c959f;border-radius:6px;padding:10px;text-align:center;font-size:12px;color:#656d76;margin-bottom:12px}
  .drop.over{border-color:#0969da;background:#ddf4ff;color:#0969da}
  .pick{color:#0969da;cursor:pointer;text-decoration:underline}
@@ -1698,6 +1762,94 @@ function keptStrip(kept) {
           <div class="pastes kept">${shown}</div>`;
 }
 
+async function deleteComment(id, cid) {
+  const row = document.getElementById("cm" + id + "-" + cid);
+  if (!confirm("Delete this comment from work item " + id + "?\n\nThis removes it from the Azure DevOps discussion and cannot be undone here.")) return;
+  if (row) row.style.opacity = ".5";
+  const project = ((detailCache[id] || {}).item || {}).project || PROJECT;
+  try {
+    await api("/api/comment/delete", {method: "POST", body: JSON.stringify(
+      {id: id, commentId: cid, project: project})});
+    await loadDetail(id);
+  } catch (e) {
+    if (row) row.style.opacity = "";
+    alert("Could not delete the comment: " + String(e.message || e));
+  }
+}
+
+// The description editor reuses the same element naming as the comment boxes
+// ("c"/"mb"/"pv"/"m"/"b" plus a key), so @mentions and paste work unchanged.
+function descKey(id) { return "desc-" + id; }
+
+function editDesc(id) {
+  const box = document.getElementById("ds" + id);
+  const d = detailCache[id];
+  if (!box || !d || box.querySelector("textarea")) return;
+  const it = d.item;
+  const repro = it.descField !== "System.Description";
+  const k = descKey(id);
+  box.dataset.html = box.innerHTML;
+  box.innerHTML =
+    `<div class="cwrap"><textarea class="ctext" id="c${k}" autocomplete="off"
+        oninput="onComment('${k}'); grow(this)"
+        onmousedown="markH(this)" onmouseup="saveH(this)"
+        onpaste="onPaste(event, '${k}', ${id})"
+        onkeydown="mentionKey(event, '${k}')"></textarea>
+       <div class="mbox" id="mb${k}"></div></div>
+     <div class="pastes" id="pv${k}"></div>
+     ${keptStrip(repro ? it.reproKept : it.descKept)}
+     <div class="acts">
+       <button onclick="saveDesc(${id})" id="b${k}">Save description</button>
+       <button class="sec" onclick="cancelDesc(${id})">Cancel</button>
+       <span class="msg" id="m${k}"></span>
+     </div>`;
+  picked[k] = [];
+  pasted[k] = [];
+  tabled[k] = [];
+  const ta = document.getElementById("c" + k);
+  ta.value = (repro ? it.repro : it.description) || "";
+  grow(ta);
+  ta.focus();
+}
+
+function cancelDesc(id) {
+  const box = document.getElementById("ds" + id);
+  const k = descKey(id);
+  delete picked[k];
+  delete pasted[k];
+  delete tabled[k];
+  if (box && box.dataset.html) box.innerHTML = box.dataset.html;
+}
+
+async function saveDesc(id) {
+  const k = descKey(id);
+  const ta = document.getElementById("c" + k);
+  const msg = document.getElementById("m" + k);
+  const btn = document.getElementById("b" + k);
+  const it = (detailCache[id] || {}).item || {};
+  const text = (ta.value || "").trim();
+  const imgs = (pasted[k] || []).filter(s => !s.pending && s.url).map(s => s.url);
+  const tbls = (tabled[k] || []).map(t => t.token);
+  const kept = (it.descField === "System.Description" ? it.descKept : it.reproKept) || {};
+  const keeps = (kept.images || []).length + (kept.tables || []).length;
+  if (!text && !imgs.length && !tbls.length && !keeps
+      && !confirm("Clear the description of work item " + id + " completely?")) return;
+  btn.disabled = true; msg.className = "msg"; msg.textContent = "Saving...";
+  const mentions = (picked[k] || []).filter(p => text.includes("@" + p.name));
+  try {
+    await api("/api/description", {method: "POST", body: JSON.stringify(
+      {id: id, field: it.descField, text: text, mentions: mentions,
+       images: imgs, tables: tbls, project: it.project || PROJECT})});
+    delete picked[k];
+    delete pasted[k];
+    delete tabled[k];
+    await loadDetail(id);
+  } catch (e) {
+    btn.disabled = false;
+    msg.className = "msg err"; msg.textContent = String(e.message || e);
+  }
+}
+
 function cancelComment(id, cid) {
   const row = document.getElementById("cm" + id + "-" + cid);
   const k = id + "-" + cid;
@@ -1749,7 +1901,8 @@ async function loadDetail(id) {
       ? d.comments.map(c => `<div class="cm" id="cm${id}-${c.id}"><span class="meta">${esc(c.author)} &middot; ${
             esc((c.at || "").slice(0, 16).replace("T", " "))}${
             c.edited ? " &middot; edited" : ""}${
-            c.mine ? ` &middot; <a href="#" onclick="event.preventDefault();editComment(${id},${c.id})">edit</a>` : ""
+            c.mine ? ` &middot; <a href="#" onclick="event.preventDefault();editComment(${id},${c.id})">edit</a>
+                     &middot; <a href="#" class="danger" onclick="event.preventDefault();deleteComment(${id},${c.id})">delete</a>` : ""
           }</span><div class="rich">${
             c.html || esc(c.text)}</div></div>`).join("")
       : `<div class="meta">No comments yet.</div>`;
@@ -1807,7 +1960,12 @@ async function loadDetail(id) {
        </div>`;
     box.innerHTML =
       `<div class="meta-grid">${meta.map(([k, v]) => `<span class="k">${k}</span><span>${v}</span>`).join("")}</div>` +
-      (body ? `<div class="desc rich">${body}</div>` : "") +
+      `<div class="k">${it.descField === "System.Description" ? "Description" : "Repro steps"}
+         &middot; <a href="#" onclick="event.preventDefault();editDesc(${id})">edit</a></div>
+       <div id="ds${id}">` +
+      (body ? `<div class="desc rich">${body}</div>`
+            : `<span class="meta">No description yet.</span>`) +
+      `</div>` +
       gallery + filesBlock + linksBlock +
       `<div class="thread"><span class="k">Discussion (${d.comments.length})</span>${thread}</div>`;
   } catch (e) { box.innerHTML = `<span class="err">${esc(String(e.message || e))}</span>`; }
@@ -2349,6 +2507,19 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/table":
                 return self._send(200, json.dumps(make_table(
                     payload.get("html") or "", payload.get("tsv") or "")))
+            if url.path == "/api/comment/delete":
+                item_id = str(payload.get("id", ""))
+                comment_id = str(payload.get("commentId", ""))
+                if not item_id.isdigit() or not comment_id.isdigit():
+                    raise ApiError(400, "Bad work item or comment id.")
+                return self._send(200, json.dumps(delete_comment(
+                    item_id, comment_id, payload.get("project"))))
+            if url.path == "/api/description":
+                item_id = str(payload.get("id", ""))
+                if not item_id.isdigit():
+                    raise ApiError(400, "Bad work item id.")
+                return self._send(200, json.dumps(
+                    edit_description(item_id, payload)))
             if url.path == "/api/comment":
                 item_id = str(payload.get("id", ""))
                 comment_id = str(payload.get("commentId", ""))
