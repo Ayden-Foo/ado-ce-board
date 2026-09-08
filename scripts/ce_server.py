@@ -42,6 +42,8 @@ ORG = os.environ.get("AZDO_ORG", "ni")
 PROJECT = os.environ.get("AZDO_PROJECT", "DevCentral")
 NONCE = secrets.token_urlsafe(24)
 URL_FILE = os.path.join(os.path.expanduser("~"), ".azdo_ce_board_url")
+ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "ce-board.ico")
 
 MAX_UPLOAD = int(os.environ.get("CE_BOARD_MAX_UPLOAD_MB", "60")) * 1024 * 1024
 
@@ -301,7 +303,12 @@ def _esc_html(text):
 
 def build_comment_html(text, mentions):
     """Turn plain comment text into the HTML Azure DevOps needs, converting
-    picked people into real @mention anchors so they get notified."""
+    picked people into real @mention anchors so they get notified.
+
+    Line breaks, blank lines and bullet or numbered lists are turned back into
+    markup, so text taken apart by to_plain_text and saved again comes out
+    looking the way it went in.
+    """
     html = _esc_html(text)
     # Longest names first so "Foo, Ayden Junior" is not clobbered by "Foo, Ayden".
     for person in sorted(mentions or [], key=lambda m: len(m.get("name") or ""),
@@ -312,7 +319,38 @@ def build_comment_html(text, mentions):
         anchor = ('<a href="#" data-vss-mention="version:2.0,{}">@{}</a>'
                   .format(_esc_html(ident), _esc_html(name)))
         html = html.replace("@" + _esc_html(name), anchor)
-    return html.replace("\r\n", "\n").replace("\n", "<br>")
+    return _lines_to_html(html.replace("\r\n", "\n").split("\n"))
+
+
+_BULLET = re.compile(r"^\s*[-*\u2022]\s+(.*)$")
+_NUMBER = re.compile(r"^\s*\d{1,3}[.)]\s+(.*)$")
+
+
+def _lines_to_html(lines):
+    """Rebuild <ul>/<ol>/<br> layout from already-escaped lines."""
+    out, list_tag, need_break = [], None, False
+    for line in lines:
+        bullet, number = _BULLET.match(line), _NUMBER.match(line)
+        want = "ul" if bullet else ("ol" if number else None)
+        if want != list_tag:
+            if list_tag:
+                out.append("</{}>".format(list_tag))
+            if want:
+                out.append("<{}>".format(want))
+            list_tag = want
+            # List markup already breaks the line, so the next plain line does
+            # not need a <br> in front of it.
+            need_break = False
+        if want:
+            out.append("<li>{}</li>".format((bullet or number).group(1).strip()))
+        else:
+            if need_break:
+                out.append("<br>")
+            out.append(line)
+            need_break = True
+    if list_tag:
+        out.append("</{}>".format(list_tag))
+    return "".join(out)
 
 
 # Attachment URLs this server minted, so a comment can only embed images that
@@ -510,7 +548,7 @@ def item_detail(item_id):
         "edited": bool(c.get("modifiedDate")
                        and c.get("modifiedDate") != c.get("createdDate")),
         "mine": bool(mine_id) and (c.get("createdBy") or {}).get("id") == mine_id,
-        "text": _strip_html(c.get("text", "")),
+        "text": to_plain_text(c.get("text", "")),
         "html": safe_html(c.get("text", "")),
         "kept": _kept_preview(c.get("text", "")),
     } for c in raw]
@@ -567,8 +605,8 @@ def item_detail(item_id):
             "tags": f.get("System.Tags", ""),
             "areaPath": f.get("System.AreaPath", ""),
             "project": owner,
-            "description": _strip_html(f.get("System.Description", "")),
-            "repro": _strip_html(f.get("Microsoft.VSTS.TCM.ReproSteps", "")),
+            "description": to_plain_text(f.get("System.Description", "")),
+            "repro": to_plain_text(f.get("Microsoft.VSTS.TCM.ReproSteps", "")),
             "descriptionHtml": safe_html(f.get("System.Description", "")),
             "reproHtml": safe_html(f.get("Microsoft.VSTS.TCM.ReproSteps", "")),
             # Which field the card is actually showing, so the editor writes
@@ -1281,6 +1319,123 @@ def safe_html(text):
     return parser.result()
 
 
+class _PlainText(HTMLParser):
+    """Flatten work item HTML to text that still carries its layout.
+
+    _strip_html collapses every run of whitespace, newlines included, which is
+    right for a one-line preview but destroys a comment the moment you open it
+    for editing. This keeps line breaks, blank lines between paragraphs, and
+    list bullets, so what build_comment_html writes back matches what was
+    there before.
+
+    Images and tables are skipped on purpose: they are preserved separately
+    and re-attached on save, so including their text here would duplicate
+    them.
+    """
+
+    BLOCKS = ("p", "div", "tr", "ul", "ol", "blockquote", "pre",
+              "h1", "h2", "h3", "h4", "h5", "h6")
+    SKIP = ("script", "style", "table")
+
+    def __init__(self):
+        HTMLParser.__init__(self, convert_charrefs=True)
+        self.out = []
+        self.skip_depth = 0
+        self.lists = []
+        self.fresh = True
+
+    def _break(self):
+        """End the current line, but never open a blank one on its own.
+
+        Block tags come in pairs, so </div><div> would otherwise double-space
+        every line of an Azure DevOps description.
+        """
+        if not self.fresh:
+            self.out.append("\n")
+            self.fresh = True
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in self.SKIP:
+            self.skip_depth += 1
+            return
+        if self.skip_depth:
+            return
+        if tag == "br":
+            # An explicit break is the author's, so it always counts: two in a
+            # row are a deliberate blank line.
+            self.out.append("\n")
+            self.fresh = True
+        elif tag in ("ul", "ol"):
+            self.lists.append([tag, 0])
+            self._break()
+        elif tag == "li":
+            self._break()
+            if self.lists and self.lists[-1][0] == "ol":
+                self.lists[-1][1] += 1
+                self.out.append("{}. ".format(self.lists[-1][1]))
+            else:
+                self.out.append("- ")
+            self.fresh = False
+        elif tag in self.BLOCKS:
+            self._break()
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in self.SKIP:
+            self.skip_depth = max(0, self.skip_depth - 1)
+            return
+        if self.skip_depth:
+            return
+        if tag in ("ul", "ol"):
+            if self.lists:
+                self.lists.pop()
+            self._break()
+        elif tag in self.BLOCKS:
+            self._break()
+
+    def handle_data(self, data):
+        if self.skip_depth:
+            return
+        # Collapse runs of spaces and tabs but never the newlines added above:
+        # HTML source indentation must not turn into blank lines in the editor.
+        text = re.sub(r"[ \t\r\f\v]+", " ", data.replace("\n", " "))
+        if not text.strip() and self.fresh:
+            return
+        self.out.append(text)
+        self.fresh = False
+
+    def result(self):
+        text = "".join(self.out).replace("\xa0", " ")
+        lines = [line.strip() for line in text.split("\n")]
+        out, blanks = [], 0
+        for i, line in enumerate(lines):
+            if line:
+                blanks = 0
+                out.append(line)
+                continue
+            blanks += 1
+            # A blank line before a list is markup spacing, not the author's
+            # layout; dropping it keeps a second edit identical to the first.
+            following = next((n for n in lines[i + 1:] if n), "")
+            if _BULLET.match(following) or _NUMBER.match(following):
+                continue
+            if blanks == 1 and out:
+                out.append("")
+        return "\n".join(out).strip()
+
+
+def to_plain_text(text):
+    """HTML to editable text, keeping the layout. Falls back to a flat strip."""
+    parser = _PlainText()
+    try:
+        parser.feed(text or "")
+        parser.close()
+    except Exception:
+        return _strip_html(text)
+    return parser.result()
+
+
 def _strip_html(text):
     text = re.sub(r"(?is)<(script|style).*?</\1>", " ", text or "")
     text = re.sub(r"(?i)<br\s*/?>|</p>|</div>", "\n", text)
@@ -1404,6 +1559,8 @@ def poll_comments(interval, stop_event):
 # must reach the browser intact rather than being consumed by Python.
 PAGE = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>My Azure DevOps CEs</title>
+<link rel="icon" href="/favicon.ico">
+<link rel="apple-touch-icon" href="/favicon.ico">
 <style>
  :root{color-scheme:light dark}
  body{font:14px/1.5 system-ui,Segoe UI,sans-serif;margin:0;background:#f6f8fa;color:#1f2328}
@@ -2388,6 +2545,21 @@ class Handler(BaseHTTPRequestHandler):
                 page = PAGE.replace("__NONCE__", NONCE).replace(
                     "__PROJECT__", PROJECT.replace('"', ""))
                 return self._send(200, page, "text/html")
+            if url.path == "/favicon.ico":
+                # Gives the tab -- and the standalone app window -- the board's
+                # own icon. It is a local file we ship, so no nonce is needed.
+                self._guard(need_nonce=False)
+                try:
+                    with open(ICON_PATH, "rb") as handle:
+                        blob = handle.read()
+                except (IOError, OSError):
+                    raise ApiError(404, "No icon.")
+                self.send_response(200)
+                self.send_header("Content-Type", "image/x-icon")
+                self.send_header("Content-Length", str(len(blob)))
+                self.send_header("Cache-Control", "private, max-age=86400")
+                self.end_headers()
+                return self.wfile.write(blob)
             if url.path == "/img":
                 # <img> requests carry no custom headers, so the nonce rides in
                 # the query string instead.

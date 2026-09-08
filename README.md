@@ -65,6 +65,7 @@ Open the **CE Board** shortcut.
 | Link a web page | Choose *Hyperlink (URL)*, paste the URL, **Add link** |
 | Detach a file or link | **Remove** on its row (asks first) |
 | Start the board | The **CE Board** icon on your Desktop or Start Menu |
+| Use it in a normal browser tab instead | Set `CE_BOARD_WINDOW=0` before launching |
 
 Screenshots are the whole point of most CEs, so they render in place. Azure
 DevOps keeps attachments behind an authenticated URL that a browser cannot fetch
@@ -133,6 +134,14 @@ sees your password.
   notification history, so that excerpt persists in Windows' own store; turn
   polling off with `CE_BOARD_POLL=0` if that is not acceptable for the content
   you handle.
+- The board opens in **its own window** -- no address bar, no tabs, its own
+  taskbar icon -- by asking the Edge or Chrome already on the machine for an
+  app window. Nothing extra is installed. If neither is found it falls back
+  to your default browser.
+- Editing keeps the **layout**: line breaks, blank lines between paragraphs
+  and bulleted or numbered lists survive the round trip, and editing the same
+  text twice does not shift it. Bold and colour are not kept -- the editor is
+  plain text -- so what you see in the box is what will be saved.
 - The Desktop shortcut runs the ordinary, Microsoft-signed `pythonw.exe`
   that is already on the machine, and wears its own icon (drawn by
   `scripts/make_icon.py`, no image library needed). It is deliberately not
