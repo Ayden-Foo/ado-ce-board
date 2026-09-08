@@ -43,6 +43,7 @@ Open the **CE Board** shortcut.
 | See your open items | Default view |
 | Open one | Click the row |
 | Change State / Assignee / Title | Expand the row, edit, **Save** |
+| Change the severity | Expand the row, pick from the **Severity** list, **Save** |
 | Comment | Expand the row, type in the comment box, **Save** |
 | Add a screenshot to a comment | Paste it straight into the comment box; a thumbnail appears, **Save** posts it |
 | Fix a comment you already posted | Click **edit** on your own comment in Discussion, change it, **Save comment** |
@@ -139,9 +140,15 @@ sees your password.
   screenshots, pasted tables, and the images already there are shown and kept.
   On a Bug that uses Repro Steps instead of Description, it edits that field,
   so saving cannot blank the wrong one.
-- Only Title, State, Assigned To, Tags, Description and Repro Steps can be
-  written by the board. Any other field name is rejected by the server.
-  Azure DevOps records the edit, so the change is auditable.
+- Only Title, State, Assigned To, Tags, Severity, Description and Repro
+  Steps can be written by the board. Any other field name is rejected by the
+  server. Azure DevOps records the edit, so the change is auditable.
+- **Severity** appears only when the work item type actually has one, and the
+  choices come from Azure DevOps, not from this tool. On a Customer Escalation
+  that is *Escalation Severity*; on a Bug it is the standard *Severity*. Before
+  saving, the server re-checks against the item's own type that the field
+  exists and the value is one it allows, so a value the project would reject
+  never gets sent. Leave it blank to clear it.
 - Pasted screenshots are uploaded to the work item as normal Azure DevOps
   attachments and embedded in the comment. Nothing is written to local disk.
   A comment can only embed an image this tool itself uploaded in the same

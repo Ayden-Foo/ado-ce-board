@@ -266,6 +266,41 @@ def type_states(work_item_type):
     return names
 
 
+# Severity is a custom field, so it is named differently from one work item
+# type to the next. These are the ones this tool knows how to write, tried in
+# order; a type that has none of them simply gets no severity control.
+SEVERITY_FIELDS = ("Custom.EscalationSeverity", "Microsoft.VSTS.Common.Severity")
+_severity_cache = {}
+
+
+def severity_choices(project, work_item_type):
+    """The severity field a work item type uses, and the values it allows.
+
+    Both come from Azure DevOps rather than from anything typed here, so the
+    board can never offer -- or save -- a value the project would reject.
+    """
+    key = (project or PROJECT, work_item_type or "")
+    if key in _severity_cache:
+        return _severity_cache[key]
+    found = ("", [])
+    if work_item_type:
+        try:
+            data = call("{}/_apis/wit/workitemtypes/{}/fields"
+                        "?%24expand=allowedValues&api-version={}".format(
+                            urllib.parse.quote(key[0]),
+                            urllib.parse.quote(work_item_type), API))
+        except ApiError:
+            data = {}
+        by_ref = {f.get("referenceName"): f for f in data.get("value", [])}
+        for ref in SEVERITY_FIELDS:
+            field = by_ref.get(ref)
+            if field and not field.get("readOnly") and field.get("allowedValues"):
+                found = (ref, [v for v in field["allowedValues"] if v])
+                break
+    _severity_cache[key] = found
+    return found
+
+
 def search_identities(query, limit=8):
     """Look up people for @mention autocomplete."""
     query = (query or "").strip()
@@ -527,16 +562,35 @@ def _allowed_images(urls):
     return out
 
 
+def _check_severity(item_id, field, value):
+    """Refuse a severity that this work item's own type does not offer."""
+    try:
+        item = call("_apis/wit/workitems/{}?fields=System.TeamProject,"
+                    "System.WorkItemType&api-version={}".format(
+                        int(item_id), API))
+    except ApiError:
+        raise ApiError(400, "Could not check the severity for this item.")
+    fields = item.get("fields") or {}
+    ref, values = severity_choices(fields.get("System.TeamProject"),
+                                   fields.get("System.WorkItemType"))
+    if field != ref:
+        raise ApiError(400, "This work item type has no severity to set.")
+    if value and value not in values:
+        raise ApiError(400, "Not a severity this work item allows.")
+
+
 def update_item(item_id, changes):
     """Apply field edits and/or a comment to one work item."""
     ops = []
     for field, value in (changes.get("fields") or {}).items():
-        if field not in ("System.Title", "System.State", "System.AssignedTo",
-                         "System.Tags"):
+        if field in SEVERITY_FIELDS:
+            _check_severity(item_id, field, str(value).strip())
+        elif field not in ("System.Title", "System.State", "System.AssignedTo",
+                           "System.Tags"):
             raise ApiError(400, "Field not editable here: {}".format(field))
-        # An empty AssignedTo means unassign, which requires a remove op.
-        if field == "System.AssignedTo" and not str(value).strip():
-            ops.append({"op": "remove", "path": "/fields/System.AssignedTo"})
+        # An empty AssignedTo or severity means clear it, which is a remove op.
+        if field in (("System.AssignedTo",) + SEVERITY_FIELDS) and not str(value).strip():
+            ops.append({"op": "remove", "path": "/fields/" + field})
         else:
             ops.append({"op": "add", "path": "/fields/" + field, "value": value})
     comment = (changes.get("comment") or "").strip()
@@ -749,6 +803,8 @@ def item_detail(item_id):
                 "comment": attrs.get("comment") or "", "external": False,
             })
     _annotate_links(links)
+    sev_field, sev_values = severity_choices(
+        owner, f.get("System.WorkItemType", ""))
     return {
         "item": {
             "id": item.get("id"),
@@ -763,6 +819,9 @@ def item_detail(item_id):
             "tags": f.get("System.Tags", ""),
             "areaPath": f.get("System.AreaPath", ""),
             "project": owner,
+            "severityField": sev_field,
+            "severity": f.get(sev_field, "") if sev_field else "",
+            "severityValues": sev_values,
             "description": to_plain_text(f.get("System.Description", "")),
             "repro": to_plain_text(f.get("Microsoft.VSTS.TCM.ReproSteps", "")),
             "descEdit": editable_html(f.get("System.Description", "")),
@@ -2169,6 +2228,7 @@ function render() {
           <div><label>State</label><select id="s${w.id}"></select></div>
           <div><label>Assigned to (email, blank to unassign)</label>
                <input id="a${w.id}" value="${esc(w.assignedTo)}"></div>
+          <div id="sv${w.id}"></div>
         </div>
         <label>Comment (added to Discussion) &mdash; type @ to tag someone,
           paste a screenshot to attach it
@@ -2449,6 +2509,23 @@ async function saveComment(id, cid) {
   }
 }
 
+// The severity field and the values it allows come from Azure DevOps with
+// the rest of the detail, so a type that has no severity gets no control.
+function drawSeverity(id) {
+  const cell = document.getElementById("sv" + id);
+  const it = (detailCache[id] || {}).item;
+  if (!cell || !it) return;
+  if (!it.severityField || !(it.severityValues || []).length) {
+    cell.innerHTML = "";
+    return;
+  }
+  const opts = [""].concat(it.severityValues).map(v =>
+    `<option value="${esc(v)}"${v === (it.severity || "") ? " selected" : ""}>${
+       esc(v) || "(none)"}</option>`).join("");
+  cell.innerHTML = `<label>Severity</label>
+    <select id="v${id}">${opts}</select>`;
+}
+
 async function loadDetail(id) {
   const box = document.getElementById("d" + id);
   if (!box) return;
@@ -2456,6 +2533,7 @@ async function loadDetail(id) {
   try {
     const d = await api("/api/detail?id=" + id);
     detailCache[id] = d;
+    drawSeverity(id);
     const it = d.item, body = it.descriptionHtml || it.reproHtml || "";
     const meta = [["Created", `${esc(it.createdBy)} on ${esc((it.createdDate || "").slice(0, 10))}`],
                   ["Updated", esc((it.changedDate || "").slice(0, 16).replace("T", " "))],
@@ -2766,12 +2844,17 @@ async function save(id) {
   const fields = {}, title = document.getElementById("t" + id).value.trim(),
         state = document.getElementById("s" + id).value,
         who = document.getElementById("a" + id).value.trim(),
+        sev = document.getElementById("v" + id),
+        it = (detailCache[id] || {}).item || {},
         comment = edText(id), commentHtml = edHtml(id);
   const imgs = (pasted[id] || []).filter(s => !s.pending && s.url).map(s => s.url);
   const tbls = (tabled[id] || []).map(t => t.token);
   if (title && title !== w.title) fields["System.Title"] = title;
   if (state && state !== w.state) fields["System.State"] = state;
   if (who !== w.assignedTo) fields["System.AssignedTo"] = who;
+  if (sev && it.severityField && sev.value !== (it.severity || "")) {
+    fields[it.severityField] = sev.value;
+  }
   if (!Object.keys(fields).length && !comment.trim() && !imgs.length && !tbls.length) { msg.className = "msg"; msg.textContent = "No changes."; return; }
   btn.disabled = true; msg.className = "msg"; msg.textContent = "Saving...";
   // Only send people actually still referenced in the text.
@@ -2779,6 +2862,7 @@ async function save(id) {
   try {
     await api("/api/item/" + id, {method: "POST", body: JSON.stringify(
       {fields, comment, html: commentHtml, mentions, images: imgs, tables: tbls})});
+    if (sev && it.severityField) it.severity = sev.value;
     msg.className = "msg ok";
     msg.textContent = "Saved." + (mentions.length ? ` Tagged ${mentions.length} person(s).` : "")
                     + (imgs.length ? ` ${imgs.length} image(s) added.` : "")
