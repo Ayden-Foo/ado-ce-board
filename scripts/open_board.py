@@ -54,6 +54,66 @@ def start_server():
         cwd=HERE, close_fds=True, creationflags=flags)
 
 
+def browser_exe():
+    """Path to Edge or Chrome, which can host the board in its own window.
+
+    The registry App Paths key is authoritative and survives the usual
+    Program Files / Program Files (x86) split, so it is tried first.
+    """
+    if sys.platform != "win32":
+        return ""
+    names = ("msedge.exe", "chrome.exe")
+    try:
+        import winreg
+    except ImportError:
+        winreg = None
+    if winreg:
+        for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for name in names:
+                try:
+                    key = winreg.OpenKey(
+                        root, r"SOFTWARE\Microsoft\Windows\CurrentVersion"
+                              r"\App Paths\{}".format(name))
+                    with key:
+                        path = winreg.QueryValue(key, None)
+                except OSError:
+                    continue
+                if path and os.path.exists(path):
+                    return path
+    for base in (os.environ.get("ProgramFiles", ""),
+                 os.environ.get("ProgramFiles(x86)", ""),
+                 os.environ.get("LOCALAPPDATA", "")):
+        for tail in (r"Microsoft\Edge\Application\msedge.exe",
+                     r"Google\Chrome\Application\chrome.exe"):
+            candidate = os.path.join(base, tail)
+            if base and os.path.exists(candidate):
+                return candidate
+    return ""
+
+
+def open_window(url):
+    """Show the board as its own window: no address bar, no tabs, own icon.
+
+    This is what makes it feel like an application without shipping one. A
+    packaged .exe is not an option here -- endpoint protection kills a renamed
+    copy of a signed interpreter -- so the board borrows a browser engine that
+    is already installed and trusted, and hides the browser.
+    """
+    if os.environ.get("CE_BOARD_WINDOW", "1") == "0":
+        return False
+    exe = browser_exe()
+    if not exe:
+        return False
+    try:
+        subprocess.Popen(
+            [exe, "--app={}".format(url), "--window-size=1360,900"],
+            close_fds=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return True
+    except OSError:
+        return False
+
+
 def main():
     if not alive():
         print("Starting the CE board...")
@@ -76,8 +136,11 @@ def main():
     if not url:
         print("Could not read the board URL from {}".format(URL_FILE))
         return 1
-    webbrowser.open(url)
-    print("CE board open at {}".format(url))
+    if open_window(url):
+        print("CE board open at {}".format(url))
+    else:
+        webbrowser.open(url)
+        print("CE board open at {} (in your browser)".format(url))
     return 0
 
 
