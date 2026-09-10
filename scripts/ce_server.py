@@ -1534,10 +1534,32 @@ def _save_seen(seen, fields):
 
 
 def fetch_comments(item_id, project=None):
+    proj = urllib.parse.quote(project or PROJECT)
     data = call("{}/_apis/wit/workItems/{}/comments?api-version=7.1-preview.4"
-                "&$top=200".format(urllib.parse.quote(project or PROJECT),
-                                   int(item_id)))
-    return data.get("comments", []) or []
+                "&$top=200".format(proj, int(item_id)))
+    comments = data.get("comments", []) or []
+    # A comment authored in "markdown" format (e.g. from a mobile client or a
+    # bot) stores its raw text as literal Markdown: **bold**, [text](url),
+    # and an @<GUID> mention marker. Feeding that straight into the HTML
+    # sanitizer is wrong -- the sanitizer's HTML parser treats "@<GUID>" as an
+    # unknown tag and drops it (leaving a bare "@"), and the ** / [] markers
+    # are left as literal punctuation since there's no real markup there.
+    # Azure DevOps already knows how to turn that Markdown into the same HTML
+    # it shows on the web, exposed per-comment via $expand=renderedText -- use
+    # that instead so markdown comments render identically to html ones.
+    for c in comments:
+        if c.get("format") == "markdown":
+            try:
+                full = call(
+                    "{}/_apis/wit/workItems/{}/comments/{}"
+                    "?api-version=7.1-preview.4&$expand=renderedText".format(
+                        proj, int(item_id), int(c["id"])))
+                rendered = full.get("renderedText")
+                if rendered:
+                    c["text"] = rendered
+            except Exception:
+                pass  # fall back to the raw markdown text if this fails
+    return comments
 
 
 def toast(title, message):
