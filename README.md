@@ -177,9 +177,11 @@ sees your password.
   polling off with `CE_BOARD_POLL=0` if that is not acceptable for the content
   you handle.
 - The board opens in **its own window** -- no address bar, no tabs, its own
-  taskbar icon -- by asking the Edge or Chrome already on the machine for an
-  app window. Nothing extra is installed. If neither is found it falls back
-  to your default browser.
+  taskbar icon -- by asking a Chromium browser already on the machine for an
+  app window. It matches whichever of Edge or Chrome you already have open,
+  then your Windows default browser, then Edge, then Chrome -- whichever is
+  actually installed. Nothing extra is installed. If none is found it falls
+  back to your default browser in a normal tab.
 - Editing keeps the **layout**: line breaks, blank lines between paragraphs
   and bulleted or numbered lists survive the round trip, and editing the same
   text twice does not shift it.
