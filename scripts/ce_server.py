@@ -809,7 +809,7 @@ def item_detail(item_id):
         "edit": editable_html(c.get("text", "")),
         "kept": _kept_preview(c.get("text", "")),
     } for c in raw]
-    comments.sort(key=lambda c: c.get("at") or "")
+    comments.sort(key=lambda c: c.get("at") or "", reverse=True)
     attachments = []
     links = []
     for rel in item.get("relations") or []:
@@ -1707,12 +1707,50 @@ ALLOWED_TAGS = {
     "blockquote", "code", "pre", "img", "hr", "font",
 }
 VOID_TAGS = {"br", "img", "hr"}
+# Elements Azure DevOps commonly styles inline rather than with a tag: a bold
+# word from Outlook, or an @mention chip, both arrive as a plain <span> or
+# <font> with a style attribute rather than <b>/<a>. "style" is allowed on
+# these so that formatting survives, but only through _clean_style below --
+# free-form CSS is not passed through as typed.
+_STYLE_TAGS = {"span", "div", "font", "p", "li", "td", "th"}
 ALLOWED_ATTRS = {
-    "a": {"href", "title"},
+    "a": {"href", "title", "data-vss-mention"},
+    "span": {"style", "data-vss-mention", "data-rendered-mention"},
+    "div": {"style"},
+    "font": {"style"},
+    "p": {"style"},
+    "li": {"style"},
+    "td": {"colspan", "rowspan", "style"},
+    "th": {"colspan", "rowspan", "style"},
     "img": {"src", "alt", "width", "height", "title"},
-    "td": {"colspan", "rowspan"},
-    "th": {"colspan", "rowspan"},
 }
+
+# A small, explicit allowlist of style properties, each with its own allowed
+# value shapes. Nothing that can load a resource (no url(), no @import) or
+# run script (no expression()) is on it, so it cannot be used to leak a read
+# receipt or worse -- it can only change how text already on the page looks.
+_COLOR_RE = re.compile(r"^(#[0-9a-f]{3,8}|rgba?\([0-9\s,.%]+\)|[a-z]+)$", re.I)
+_STYLE_VALUES = {
+    "color": _COLOR_RE,
+    "background-color": _COLOR_RE,
+    "font-weight": re.compile(r"^(normal|bold|bolder|lighter|[1-9]00)$", re.I),
+    "font-style": re.compile(r"^(normal|italic|oblique)$", re.I),
+    "text-decoration": re.compile(
+        r"^(none|underline|line-through|overline)$", re.I),
+    "text-align": re.compile(r"^(left|right|center|justify)$", re.I),
+    "font-size": re.compile(r"^\d{1,2}(\.\d+)?(px|pt|em|rem|%)$", re.I),
+}
+
+
+def _clean_style(value):
+    kept = []
+    for part in (value or "").split(";"):
+        prop, _, val = part.partition(":")
+        prop, val = prop.strip().lower(), val.strip()
+        pattern = _STYLE_VALUES.get(prop)
+        if pattern and val and pattern.match(val):
+            kept.append("{}:{}".format(prop, val))
+    return ";".join(kept)
 
 
 class _Sanitizer(HTMLParser):
@@ -1740,11 +1778,27 @@ class _Sanitizer(HTMLParser):
             return
         kept = []
         allowed = ALLOWED_ATTRS.get(tag, set())
+        # An @mention is written as an anchor to "#" -- there is nothing to
+        # navigate to, Azure DevOps just uses it as a place to hang the
+        # mention -- so it would otherwise fail the href check below and lose
+        # its styling. Detecting it here keeps every mention looking the
+        # same regardless of which client (web, Outlook, Teams) wrote it.
+        is_mention = tag in ("a", "span") and any(
+            (n or "").lower() in ("data-vss-mention", "data-rendered-mention")
+            for n, v in attrs)
         for name, value in attrs:
             name = (name or "").lower()
             if name not in allowed or value is None:
                 continue
+            if name == "style" and tag in _STYLE_TAGS:
+                value = _clean_style(value)
+                if not value:
+                    continue
+            if name in ("data-vss-mention", "data-rendered-mention"):
+                continue  # only used above to detect a mention, never shown
             if tag == "a" and name == "href":
+                if value.strip() == "#" and is_mention:
+                    continue  # nothing to link to; the mention class covers it
                 if not re.match(r"(?i)^(https?:|mailto:)", value.strip()):
                     continue
             if tag == "img" and name == "src":
@@ -1753,7 +1807,9 @@ class _Sanitizer(HTMLParser):
                     return  # unusable image: drop the whole tag
                 self.images += 1
             kept.append(' {}="{}"'.format(name, _esc_html(value)))
-        if tag == "a":
+        if is_mention:
+            kept.append(' class="mention"')
+        if tag == "a" and not is_mention:
             kept.append(' target="_blank" rel="noopener noreferrer"')
         self.out.append("<{}{}>".format(tag, "".join(kept)))
         if tag not in VOID_TAGS:
@@ -2144,6 +2200,13 @@ PAGE = r"""<!doctype html>
  .rich pre{background:#f6f8fa;padding:8px;border-radius:6px;overflow:auto}
  .rich p{margin:6px 0}
  .rich a{color:#0969da}
+ .rich .mention{font-weight:600;color:#0969da;background:#ddf4ff;
+   border-radius:4px;padding:0 3px}
+ .cm.latest{animation:latestFlash 1.6s ease-out}
+ @keyframes latestFlash{
+   from{background:#fff8c5}
+   to{background:transparent}
+ }
  .pastes.kept{margin-top:2px}
     .paste.tbl.tedit{max-width:100%;background:#fff}
     .tedit .tprev{max-height:280px;max-width:100%;font-size:12px}
@@ -2601,7 +2664,7 @@ async function loadDetail(id) {
                   ["Area", esc(it.areaPath)], ["Reason", esc(it.reason)],
                   ["Tags", esc(it.tags) || "-"]];
     const thread = d.comments.length
-      ? d.comments.map(c => `<div class="cm" id="cm${id}-${c.id}"><span class="meta">${esc(c.author)} &middot; ${
+      ? d.comments.map((c, i) => `<div class="cm${i === 0 ? " latest" : ""}" id="cm${id}-${c.id}"><span class="meta">${esc(c.author)} &middot; ${
             esc((c.at || "").slice(0, 16).replace("T", " "))}${
             c.edited ? " &middot; edited" : ""}${
             c.mine ? ` &middot; <a href="#" onclick="event.preventDefault();editComment(${id},${c.id})">edit</a>
@@ -2670,7 +2733,11 @@ async function loadDetail(id) {
             : `<span class="meta">No description yet.</span>`) +
       `</div>` +
       gallery + filesBlock + linksBlock +
-      `<div class="thread"><span class="k">Discussion (${d.comments.length})</span>${thread}</div>`;
+      `<div class="thread"><span class="k">Discussion (${d.comments.length}) &mdash; newest first</span>${thread}</div>`;
+    // Comments are newest first, so the newest is already scrolled into
+    // view; it also flashes briefly (see .latest) to draw the eye to it.
+    const th = box.querySelector(".thread");
+    if (th) th.scrollTop = 0;
   } catch (e) { box.innerHTML = `<span class="err">${esc(String(e.message || e))}</span>`; }
 }
 

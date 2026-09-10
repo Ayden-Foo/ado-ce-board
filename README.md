@@ -46,6 +46,7 @@ Open the **CE Board** shortcut.
 | Change the severity | Expand the row, pick from the severity list, **Save** |
 | See the severity at a glance | A coloured badge next to the state, when the item has one |
 | Comment | Expand the row, type in the comment box, **Save** |
+| Read the discussion | Newest comment first; it briefly highlights so you spot it right away |
 | Add a screenshot to a comment | Paste it straight into the comment box; a thumbnail appears, **Save** posts it |
 | Fix a comment you already posted | Click **edit** on your own comment in Discussion, change it, **Save comment** |
 | Delete a comment you posted | Click **delete** on your own comment; it asks first |
@@ -113,6 +114,17 @@ sees your password.
 - Attachments and inline images are fetched with your token by the board, and
   only from this organisation's Azure DevOps host. Redirects are not followed,
   so your token cannot be forwarded elsewhere.
+- Comments show **newest first**, and the newest one briefly highlights when
+  you open a case, so you land on the latest update without scrolling.
+- @mentions display the same way regardless of which client wrote them --
+  Azure DevOps writes an @mention as an anchor to nowhere in particular, or as
+  a plain styled span, depending on where it was typed. Either way it is shown
+  as the same highlighted mention chip here.
+- A handful of safe formatting properties -- bold, italic, underline, colour,
+  highlight -- are kept even when Azure DevOps writes them as an inline style
+  rather than a tag, which is common in text pasted from Outlook or Teams.
+  Anything that could load a resource or run code, like a background image,
+  is stripped regardless.
 - The comment editor has the same @mention, screenshot paste and table paste
   as the new-comment box.
 - While editing, any screenshots and tables already in that comment are shown
