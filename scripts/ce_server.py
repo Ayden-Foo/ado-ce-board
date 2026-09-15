@@ -2181,6 +2181,7 @@ PAGE = r"""<!doctype html>
  .acts{margin-top:12px;display:flex;gap:8px;align-items:center}
  button{background:#1f883d;color:#fff;border:0;padding:8px 16px;border-radius:6px;cursor:pointer;font:inherit;font-weight:500}
  button.sec{background:#f6f8fa;color:#24292f;border:1px solid #d0d7de}
+ button.sec.danger{color:#cf222e;border-color:#ffb3ba}
  button:disabled{opacity:.6;cursor:default}
  .msg{font-size:13px}.ok{color:#1a7f37}.err{color:#cf222e}
  .empty{padding:40px;text-align:center;color:#656d76}
@@ -2275,6 +2276,19 @@ PAGE = r"""<!doctype html>
  #lb{display:none;position:fixed;inset:0;z-index:100;background:rgba(13,17,23,.85);align-items:center;justify-content:center;cursor:zoom-out}
  #lb.show{display:flex}
  #lb img{max-width:92vw;max-height:92vh;border-radius:6px;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+ #linkModal{display:none;position:fixed;inset:0;z-index:110;background:rgba(13,17,23,.45);align-items:center;justify-content:center}
+ #linkModal.show{display:flex}
+ #linkModal .box{background:#fff;border-radius:8px;padding:18px 20px;width:360px;max-width:90vw;box-shadow:0 12px 40px rgba(0,0,0,.35)}
+ #linkModal h3{margin:0 0 12px;font-size:15px}
+ #linkModal label{display:block;font-size:12px;color:#656d76;margin:10px 0 4px}
+ #linkModal input{width:100%;box-sizing:border-box;font-size:13px;padding:6px 8px;border:1px solid #d0d7de;border-radius:6px}
+ #linkModal .acts{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+ #linkModal .acts .rm{margin-right:auto}
+ #linkCtx{display:none;position:fixed;z-index:120;background:#fff;border:1px solid #d0d7de;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,.2);padding:4px;min-width:160px}
+ #linkCtx.show{display:block}
+ #linkCtx button{display:block;width:100%;text-align:left;background:none;border:0;padding:6px 10px;font-size:13px;cursor:pointer;border-radius:4px}
+ #linkCtx button:hover{background:#f0f2f4}
+ #linkCtx button.danger{color:#cf222e}
  #signin{display:none;background:#fff;border:1px solid #d0d7de;border-radius:8px;padding:22px;text-align:center}
  #signin.show{display:block}
  #signin h2{margin:0 0 8px;font-size:17px}
@@ -2318,6 +2332,25 @@ PAGE = r"""<!doctype html>
  </div>
 </main>
 <div id="lb" onclick="this.classList.remove('show')"><img id="lbimg" alt=""></div>
+<div id="linkModal">
+  <div class="box">
+    <h3 id="linkModalTitle">Insert link</h3>
+    <label>Web address</label>
+    <input id="linkUrl" placeholder="https://">
+    <label>Text to display</label>
+    <input id="linkText" placeholder="Link text">
+    <div class="acts">
+      <button class="sec danger rm" type="button" id="linkRemove" style="display:none">Remove link</button>
+      <button class="sec" type="button" id="linkCancel">Cancel</button>
+      <button type="button" id="linkSave">Save</button>
+    </div>
+  </div>
+</div>
+<div id="linkCtx">
+  <button type="button" id="ctxInsert">Insert link&hellip;</button>
+  <button type="button" id="ctxEdit">Edit link&hellip;</button>
+  <button type="button" class="danger" id="ctxRemove">Remove link</button>
+</div>
 <script>
 const NONCE = "__NONCE__";
 const PROJECT = "__PROJECT__";
@@ -3043,6 +3076,7 @@ function editorBox(key, itemId, placeholder) {
       ${b("italic", "<i>I</i>", "Italic (Ctrl+I)")}
       ${b("underline", "<u>U</u>", "Underline (Ctrl+U)")}
       ${b("hilite", "<span class=hl>&nbsp;A&nbsp;</span>", "Highlight, or remove it")}
+      ${b("link", "&#128279;", "Insert a hyperlink, or edit/remove the one at the cursor")}
       <span class="sep"></span>
       ${b("insertUnorderedList", "&bull;&nbsp;list", "Bulleted list")}
       ${b("insertOrderedList", "1.&nbsp;list", "Numbered list")}
@@ -3067,6 +3101,7 @@ function rte(key, cmd) {
   const box = document.getElementById("c" + key);
   if (!box) return;
   box.focus();
+  if (cmd === "link") { rteLink(key); return; }
   if (cmd === "hilite") {
     try { document.execCommand("styleWithCSS", false, true); } catch (e) { /* older browser */ }
     const now = (document.queryCommandValue("backColor") || "").replace(/\s/g, "").toLowerCase();
@@ -3081,6 +3116,152 @@ function rte(key, cmd) {
   try { document.execCommand("styleWithCSS", false, false); } catch (e) { /* older browser */ }
   document.execCommand(cmd, false, null);
 }
+
+// A link is inserted with its own text (which need not match a URL, or even
+// be selected text), so it needs its own dialog-driven flow rather than a
+// single execCommand -- and both the toolbar button and a right-click on an
+// existing link route through the same modal, which shows the URL and the
+// display text together and offers Remove when editing.
+function linkAt(box) {
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount) return null;
+  let node = sel.getRangeAt(0).commonAncestorContainer;
+  if (node.nodeType === 3) node = node.parentNode;
+  const a = node && node.closest ? node.closest("a") : null;
+  return (a && box.contains(a)) ? a : null;
+}
+
+let linkState = null; // {key, existing, savedRange}
+
+function _saveCaret(box) {
+  const sel = window.getSelection();
+  if (sel && sel.rangeCount && box.contains(sel.getRangeAt(0).commonAncestorContainer)) {
+    return sel.getRangeAt(0).cloneRange();
+  }
+  return null;
+}
+
+function openLinkModal(key, existing, savedRange) {
+  linkState = {key, existing, savedRange};
+  const box = document.getElementById("c" + key);
+  const sel = window.getSelection();
+  const selectedText = existing ? existing.textContent
+    : (sel && box && box.contains(sel.anchorNode) ? sel.toString() : "");
+  document.getElementById("linkModalTitle").textContent = existing ? "Edit link" : "Insert link";
+  document.getElementById("linkUrl").value = existing ? (existing.getAttribute("href") || "") : "https://";
+  document.getElementById("linkText").value = selectedText || "";
+  document.getElementById("linkRemove").style.display = existing ? "" : "none";
+  document.getElementById("linkModal").classList.add("show");
+  document.getElementById("linkUrl").focus();
+  document.getElementById("linkUrl").select();
+}
+
+function closeLinkModal() {
+  document.getElementById("linkModal").classList.remove("show");
+  linkState = null;
+}
+
+function rteLink(key) {
+  const box = document.getElementById("c" + key);
+  if (!box) return;
+  box.focus();
+  openLinkModal(key, linkAt(box), _saveCaret(box));
+}
+
+function _normLinkHref(value) {
+  const v = value.trim();
+  return /^(https?:|mailto:)/i.test(v) ? v : "https://" + v;
+}
+
+function saveLinkModal() {
+  if (!linkState) return;
+  const {key, existing, savedRange} = linkState;
+  const box = document.getElementById("c" + key);
+  const url = document.getElementById("linkUrl").value;
+  const text = document.getElementById("linkText").value;
+  if (!url.trim() || !text.trim()) { closeLinkModal(); return; }
+  const href = _normLinkHref(url);
+  box.focus();
+  if (existing) {
+    existing.setAttribute("href", href);
+    existing.textContent = text;
+  } else {
+    const html = `<a href="${esc(href)}">${esc(text)}</a>`;
+    if (savedRange) {
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(savedRange);
+    }
+    try { document.execCommand("styleWithCSS", false, false); } catch (e) { /* older browser */ }
+    if (!document.execCommand("insertHTML", false, html) && savedRange) {
+      savedRange.deleteContents();
+      const a = document.createElement("a");
+      a.href = href;
+      a.textContent = text;
+      savedRange.insertNode(a);
+    }
+  }
+  onComment(key);
+  closeLinkModal();
+}
+
+function removeLinkModal() {
+  if (!linkState || !linkState.existing) { closeLinkModal(); return; }
+  const {key, existing} = linkState;
+  existing.replaceWith(document.createTextNode(existing.textContent));
+  onComment(key);
+  closeLinkModal();
+}
+
+document.getElementById("linkSave").onclick = saveLinkModal;
+document.getElementById("linkRemove").onclick = removeLinkModal;
+document.getElementById("linkCancel").onclick = closeLinkModal;
+document.getElementById("linkModal").addEventListener("mousedown", e => {
+  if (e.target.id === "linkModal") closeLinkModal();
+});
+document.getElementById("linkUrl").addEventListener("keydown", e => { if (e.key === "Enter") saveLinkModal(); });
+document.getElementById("linkText").addEventListener("keydown", e => { if (e.key === "Enter") saveLinkModal(); });
+
+// Right-click inside any comment/description editor: a link under the
+// cursor offers Edit/Remove, otherwise (or with a selection) it offers
+// Insert -- a small custom menu, since a real context-menu entry cannot be
+// added to the browser's own menu.
+let ctxState = null; // {key, existing, savedRange}
+
+function showLinkCtx(x, y, key, existing, savedRange) {
+  ctxState = {key, existing, savedRange};
+  const m = document.getElementById("linkCtx");
+  document.getElementById("ctxInsert").style.display = existing ? "none" : "";
+  document.getElementById("ctxEdit").style.display = existing ? "" : "none";
+  document.getElementById("ctxRemove").style.display = existing ? "" : "none";
+  m.style.left = Math.min(x, window.innerWidth - 180) + "px";
+  m.style.top = Math.min(y, window.innerHeight - 100) + "px";
+  m.classList.add("show");
+}
+
+function hideLinkCtx() { document.getElementById("linkCtx").classList.remove("show"); ctxState = null; }
+
+document.addEventListener("contextmenu", e => {
+  const box = e.target.closest ? e.target.closest(".ctext") : null;
+  if (!box) { hideLinkCtx(); return; }
+  e.preventDefault();
+  const key = box.id.slice(1);
+  const existing = linkAt(box);
+  showLinkCtx(e.clientX, e.clientY, key, existing, existing ? null : _saveCaret(box));
+});
+document.addEventListener("mousedown", e => {
+  if (!e.target.closest || !e.target.closest("#linkCtx")) hideLinkCtx();
+});
+document.getElementById("ctxInsert").onclick = () => {
+  const {key, savedRange} = ctxState; hideLinkCtx(); openLinkModal(key, null, savedRange);
+};
+document.getElementById("ctxEdit").onclick = () => {
+  const {key, existing} = ctxState; hideLinkCtx(); openLinkModal(key, existing, null);
+};
+document.getElementById("ctxRemove").onclick = () => {
+  const {key, existing} = ctxState; hideLinkCtx();
+  if (existing) { existing.replaceWith(document.createTextNode(existing.textContent)); onComment(key); }
+};
 
 function edText(key) {
   const b = document.getElementById("c" + key);
